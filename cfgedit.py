@@ -1,9 +1,22 @@
 from http.server import HTTPServer,BaseHTTPRequestHandler
-import urllib.parse,urllib.request,os,json,http.client
+import urllib.parse,urllib.request,os,json,http.client,subprocess,sys,threading
 CONFIG='/app/config.yaml'
 STATUS='/tmp/serve_status.json'
 DOWNLOADER_FILE='/app/downloader'
 LLAMA_SWAP_HOST='localhost'; LLAMA_SWAP_PORT=8080
+SCRIPTS_BASE='https://raw.githubusercontent.com/klutzydrummer/vastai-llmrunner/main'
+SCRIPTS=['serve.py','cfgedit.py','guard.py','cfginit.py','init.sh']
+
+def update_scripts():
+    for f in SCRIPTS:
+        urllib.request.urlretrieve(f'{SCRIPTS_BASE}/{f}',f'/tmp/{f}')
+    os.chmod('/tmp/init.sh',0o755)
+    subprocess.run(['pkill','-f','/tmp/guard.py'],check=False)
+    subprocess.Popen([sys.executable,'/tmp/guard.py'],
+                     stdout=open('/tmp/guard.log','a'),stderr=subprocess.STDOUT)
+    print('[cfgedit] restarting with updated script',flush=True)
+    import time; time.sleep(0.3)
+    os.execv(sys.executable,[sys.executable,'/tmp/cfgedit.py'])
 
 def llama_swap(method,path,body=None):
     try:
@@ -72,6 +85,9 @@ class H(BaseHTTPRequestHandler):
             if v: open(DOWNLOADER_FILE,'w').write(v)
             elif os.path.exists(DOWNLOADER_FILE): os.remove(DOWNLOADER_FILE)
             print(f'[cfgedit] downloader: {v or "cleared"}',flush=True);self.ok(b'OK\n')
+        elif self.path=='/update':
+            self.ok(b'OK\n')
+            threading.Thread(target=update_scripts,daemon=True).start()
         else: self.send_response(404);self.end_headers()
     def _ui(self):
         d=open(CONFIG,'r').read().replace('&','&amp;').replace('<','&lt;')
@@ -88,6 +104,7 @@ class H(BaseHTTPRequestHandler):
 </select></label>
 <button onclick="doUnload()">Unload</button>
 <button onclick="doSave()">Save &amp; Reload</button>
+<button onclick="doUpdate()">Update Scripts</button>
 <span id=msg style="font-size:12px;color:#888"></span>
 </div>
 <small>p1=max ctx single user | p2/p4=split ctx | p8=may OOM on single GPU</small><br>
@@ -96,6 +113,7 @@ class H(BaseHTTPRequestHandler):
 var M=document.getElementById('msg'),E='/editor';
 function setDL(v){{fetch(E+'/downloader',{{method:'POST',body:v}}).then(()=>M.textContent='✓ downloader set')}}
 function doUnload(){{fetch(E+'/unload',{{method:'POST'}}).then(()=>M.textContent='✓ unloaded')}}
+function doUpdate(){{M.textContent='updating...';fetch(E+'/update',{{method:'POST'}}).then(()=>{{M.textContent='restarting...';setTimeout(()=>location.reload(),3000)}}).catch(()=>{{M.textContent='restarting...';setTimeout(()=>location.reload(),3000)}})}}
 function doSave(){{M.textContent='saving...';fetch(E+'/config',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:'cfg='+encodeURIComponent(document.getElementById('cfg').value)}}).then(r=>M.textContent=r.ok?'✓ saved':'✗ '+r.status)}}
 function poll(){{
   Promise.all([fetch(E+'/status').then(r=>r.json()),fetch(E+'/running').then(r=>r.json())])
