@@ -93,12 +93,12 @@ class H(BaseHTTPRequestHandler):
 <small>p1=max ctx single user | p2/p4=split ctx | p8=may OOM on single GPU</small><br>
 <textarea id=cfg>{d}</textarea>
 <script>
-var M=document.getElementById('msg');
-function setDL(v){{fetch('/downloader',{{method:'POST',body:v}}).then(()=>M.textContent='✓ downloader set')}}
-function doUnload(){{fetch('/unload',{{method:'POST'}}).then(()=>M.textContent='✓ unloaded')}}
-function doSave(){{M.textContent='saving...';fetch('/config',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:'cfg='+encodeURIComponent(document.getElementById('cfg').value)}}).then(r=>M.textContent=r.ok?'✓ saved':'✗ '+r.status)}}
+var M=document.getElementById('msg'),E='/editor';
+function setDL(v){{fetch(E+'/downloader',{{method:'POST',body:v}}).then(()=>M.textContent='✓ downloader set')}}
+function doUnload(){{fetch(E+'/unload',{{method:'POST'}}).then(()=>M.textContent='✓ unloaded')}}
+function doSave(){{M.textContent='saving...';fetch(E+'/config',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:'cfg='+encodeURIComponent(document.getElementById('cfg').value)}}).then(r=>M.textContent=r.ok?'✓ saved':'✗ '+r.status)}}
 function poll(){{
-  Promise.all([fetch('/status').then(r=>r.json()),fetch('/running').then(r=>r.json())])
+  Promise.all([fetch(E+'/status').then(r=>r.json()),fetch(E+'/running').then(r=>r.json())])
   .then(([s,r])=>{{
     var st=s.status||'idle',m=r.model,txt=st;
     if(m)txt='ready — '+m;
