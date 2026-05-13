@@ -6,6 +6,13 @@ DOWNLOADER_FILE='/app/downloader'
 LLAMA_SWAP_HOST='localhost'; LLAMA_SWAP_PORT=8080
 SCRIPTS_BASE='https://raw.githubusercontent.com/klutzydrummer/vastai-llmrunner/main'
 SCRIPTS=['serve.py','cfgedit.py','guard.py','cfginit.py','init.sh']
+LOGS={'guard':'/tmp/guard.log','llama-swap':'/tmp/llama-swap.log',
+      'caddy':'/tmp/caddy.log','cfgedit':'/tmp/cfgedit.log','cloudflared':'/tmp/cloudflared.log'}
+
+def tail(path,n=300):
+    try:
+        lines=open(path).readlines(); return ''.join(lines[-n:])
+    except: return f'(no log at {path})\n'
 
 def update_scripts():
     for f in SCRIPTS:
@@ -68,6 +75,13 @@ class H(BaseHTTPRequestHandler):
             cur=open(DOWNLOADER_FILE).read().strip() if os.path.exists(DOWNLOADER_FILE) else 'env default'
             self.ok(cur.encode())
         elif self.path=='/': self._ui()
+        elif self.path=='/debug': self._debug_ui()
+        elif self.path.startswith('/logfile'):
+            q=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            name=q.get('name',[''])[0]
+            self.ok(tail(LOGS[name]).encode() if name in LOGS else (','.join(LOGS)).encode())
+        elif self.path=='/processes':
+            self.ok(subprocess.run(['ps','aux'],capture_output=True,text=True).stdout.encode())
         else: self.send_response(404);self.end_headers()
     def do_PUT(self):
         if self.path=='/config':
@@ -105,6 +119,7 @@ class H(BaseHTTPRequestHandler):
 <button onclick="doUnload()">Unload</button>
 <button onclick="doSave()">Save &amp; Reload</button>
 <button onclick="doUpdate()">Update Scripts</button>
+<a href="/editor/debug" target="_blank"><button type=button>Logs / Debug</button></a>
 <span id=msg style="font-size:12px;color:#888"></span>
 </div>
 <small>p1=max ctx single user | p2/p4=split ctx | p8=may OOM on single GPU</small><br>
@@ -127,6 +142,31 @@ function poll(){{
   }}).catch(()=>{{}})
 }}
 poll();setInterval(poll,2000);
+</script></body></html>'''
+        self.ok(html.encode(),'text/html')
+
+    def _debug_ui(self):
+        opts=''.join(f'<option>{k}</option>' for k in LOGS)
+        html=f'''<!DOCTYPE html><html><head><meta charset=utf-8><title>debug</title>
+<style>body{{font-family:monospace;margin:1em;font-size:12px}}
+pre{{background:#111;color:#0f0;padding:8px;height:38vh;overflow-y:auto;white-space:pre-wrap;word-break:break-all}}
+button{{margin:2px;padding:3px 8px}}h3{{margin:6px 0}}</style></head><body>
+<h3>Processes <button onclick="loadPS()">↻</button></h3><pre id=ps>loading...</pre>
+<h3>Log: <select id=lg onchange="loadLog()">{opts}</select>
+<button onclick="loadLog()">↻</button>
+<label><input type=checkbox id=as checked> auto-scroll</label></h3>
+<pre id=log>loading...</pre>
+<script>
+var E='/editor';
+function loadPS(){{fetch(E+'/processes').then(r=>r.text()).then(t=>document.getElementById('ps').textContent=t)}}
+function loadLog(){{
+  var p=document.getElementById('log');
+  fetch(E+'/logfile?name='+document.getElementById('lg').value).then(r=>r.text()).then(t=>{{
+    p.textContent=t;if(document.getElementById('as').checked)p.scrollTop=p.scrollHeight;
+  }})
+}}
+loadPS();loadLog();
+setInterval(loadLog,2000);setInterval(loadPS,10000);
 </script></body></html>'''
         self.ok(html.encode(),'text/html')
 
