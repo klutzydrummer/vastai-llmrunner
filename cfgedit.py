@@ -41,9 +41,10 @@ def get_running():
     if s==200:
         try:
             r=json.loads(d)
-            if isinstance(r,dict):
-                for k,v in r.items():
-                    if isinstance(v,dict) and v: return k
+            if isinstance(r,dict) and r:
+                v=r.get('running')
+                if v and isinstance(v,str): return v
+                return next((k for k in r if k!='running'),None)
         except: pass
     return None
 
