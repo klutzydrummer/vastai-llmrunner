@@ -19,7 +19,10 @@ def get_running():
         c.request('GET','/running'); r=c.getresponse()
         if r.status==200:
             d=json.loads(r.read())
-            if isinstance(d,dict) and d: return next(iter(d))
+            if isinstance(d,dict) and d:
+                v=d.get('running')
+                if v and isinstance(v,str): return v
+                return next((k for k in d if k!='running'),None)
         c.close()
     except: pass
     return None
