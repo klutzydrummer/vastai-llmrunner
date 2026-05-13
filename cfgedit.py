@@ -80,7 +80,12 @@ class H(BaseHTTPRequestHandler):
         elif self.path.startswith('/logfile'):
             q=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             name=q.get('name',[''])[0]
-            self.ok(tail(LOGS[name]).encode() if name in LOGS else (','.join(LOGS)).encode())
+            if name in LOGS:
+                self.ok(tail(LOGS[name]).encode())
+            elif name and '/' not in name and name.endswith('.log'):
+                self.ok(tail(f'/tmp/{name}').encode())
+            else:
+                self.ok((','.join(LOGS)).encode())
         elif self.path=='/processes':
             self.ok(subprocess.run(['ps','aux'],capture_output=True,text=True).stdout.encode())
         else: self.send_response(404);self.end_headers()
@@ -147,7 +152,10 @@ poll();setInterval(poll,2000);
         self.ok(html.encode(),'text/html')
 
     def _debug_ui(self):
-        opts=''.join(f'<option>{k}</option>' for k in LOGS)
+        import glob
+        known={v:k for k,v in LOGS.items()}
+        found=sorted(glob.glob('/tmp/*.log'))
+        opts=''.join(f'<option value="{os.path.basename(p)}">{known.get(p,os.path.basename(p))}</option>' for p in found)
         html=f'''<!DOCTYPE html><html><head><meta charset=utf-8><title>debug</title>
 <style>body{{font-family:monospace;margin:1em;font-size:12px}}
 pre{{background:#111;color:#0f0;padding:8px;height:38vh;overflow-y:auto;white-space:pre-wrap;word-break:break-all}}
@@ -165,7 +173,7 @@ function loadPS(){{fetch(E+'/processes').then(r=>r.text()).then(t=>document.getE
 function loadLog(){{
   if(paused)return;
   var p=document.getElementById('log');
-  fetch(E+'/logfile?name='+document.getElementById('lg').value).then(r=>r.text()).then(t=>{{
+  fetch(E+'/logfile?name='+encodeURIComponent(document.getElementById('lg').value)).then(r=>r.text()).then(t=>{{
     p.textContent=t;if(document.getElementById('as').checked)p.scrollTop=p.scrollHeight;
   }})
 }}
