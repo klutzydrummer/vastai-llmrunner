@@ -155,12 +155,15 @@ button{{margin:2px;padding:3px 8px}}h3{{margin:6px 0}}</style></head><body>
 <h3>Processes <button onclick="loadPS()">↻</button></h3><pre id=ps>loading...</pre>
 <h3>Log: <select id=lg onchange="loadLog()">{opts}</select>
 <button onclick="loadLog()">↻</button>
+<button id=pb onclick="togglePause()">⏸ Pause</button>
 <label><input type=checkbox id=as checked> auto-scroll</label></h3>
 <pre id=log>loading...</pre>
 <script>
-var E='/editor';
+var E='/editor',paused=false;
+function togglePause(){{paused=!paused;document.getElementById('pb').textContent=paused?'▶ Resume':'⏸ Pause'}}
 function loadPS(){{fetch(E+'/processes').then(r=>r.text()).then(t=>document.getElementById('ps').textContent=t)}}
 function loadLog(){{
+  if(paused)return;
   var p=document.getElementById('log');
   fetch(E+'/logfile?name='+document.getElementById('lg').value).then(r=>r.text()).then(t=>{{
     p.textContent=t;if(document.getElementById('as').checked)p.scrollTop=p.scrollHeight;
