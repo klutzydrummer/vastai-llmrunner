@@ -26,17 +26,28 @@ def remote_size(url):
             return int(cl) if cl else None
     except: return None
 
+def _is_active(fp):
+    try:
+        pid=int(open(fp+'.pid').read())
+        return os.path.exists(f'/proc/{pid}')
+    except: return False
+
 def ensure_space(needed_bytes,keep):
     free=shutil.disk_usage(MODEL_DIR).free
     print(f'[serve] disk: {free//1048576}MB free, need {needed_bytes//1048576}MB',flush=True)
     if free>=needed_bytes*1.1: return
     print(f'[serve] insufficient space — evicting old models',flush=True)
-    for f in sorted(os.listdir(MODEL_DIR)):
-        fp=os.path.join(MODEL_DIR,f)
-        if fp in keep or not os.path.isfile(fp) or not f.endswith('.gguf'): continue
-        sz=os.path.getsize(fp)
-        os.remove(fp)
-        print(f'[serve] evicted {f} ({sz//1048576}MB)',flush=True)
+    for allow_active in (False,True):
+        for f in sorted(os.listdir(MODEL_DIR)):
+            fp=os.path.join(MODEL_DIR,f)
+            if fp in keep or not os.path.isfile(fp) or not f.endswith('.gguf'): continue
+            if not allow_active and _is_active(fp): continue
+            sz=os.path.getsize(fp)
+            os.remove(fp)
+            try: os.remove(fp+'.pid')
+            except: pass
+            print(f'[serve] evicted {f} ({sz//1048576}MB, was_active={allow_active})',flush=True)
+            if shutil.disk_usage(MODEL_DIR).free>=needed_bytes*1.1: break
         if shutil.disk_usage(MODEL_DIR).free>=needed_bytes*1.1: break
     print(f'[serve] disk after eviction: {shutil.disk_usage(MODEL_DIR).free//1048576}MB free',flush=True)
 
@@ -267,4 +278,7 @@ else:
     args+=['--gpu-layers',os.environ.get('GPU_LAYERS','99')]
 binary=find_binary()
 print(f'[serve] exec {binary} {args}',flush=True)
+for _p in [mp]+([mmp] if mmp and os.path.isfile(mmp) else []):
+    try: open(_p+'.pid','w').write(str(os.getpid()))
+    except: pass
 os.execv(binary,[binary]+args)
