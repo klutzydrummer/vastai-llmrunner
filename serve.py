@@ -189,10 +189,31 @@ mmp=''
 if MMPROJ_URL and MMPROJ_URL not in ('','null'):
     mmp=dl(MMPROJ_URL,keep)
 
-try:
-    r=sp.run(['nvidia-smi','--query-gpu=memory.total','--format=csv,noheader,nounits'],capture_output=True,text=True)
-    vrams=[int(x) for x in r.stdout.strip().split('\n') if x.strip()]
-except: vrams=[]
+def _detect_vrams(retries=5,delay=3):
+    best=[];prev=None
+    for attempt in range(retries):
+        try:
+            r=sp.run(['nvidia-smi','--query-gpu=memory.total','--format=csv,noheader,nounits'],
+                     capture_output=True,text=True,timeout=10)
+            parsed=[int(x) for x in r.stdout.strip().split('\n') if x.strip()]
+            print(f'[serve] nvidia-smi attempt {attempt+1}/{retries}: {parsed}',flush=True)
+            if len(parsed)>len(best): best=parsed
+            if parsed and parsed==prev:
+                print(f'[serve] GPU count stable at {len(best)}',flush=True); break
+            prev=parsed
+        except Exception as e:
+            print(f'[serve] nvidia-smi attempt {attempt+1}/{retries} failed: {e}',flush=True)
+            prev=None
+        if attempt<retries-1:
+            print(f'[serve] retrying GPU detection in {delay}s...',flush=True)
+            time.sleep(delay)
+    if not best:
+        print(f'[serve] warn: no GPUs detected after {retries} attempts, will use CPU offload',flush=True)
+    else:
+        print(f'[serve] detected {len(best)} GPU(s): {best} MiB  total={sum(best)} MiB',flush=True)
+    return best
+
+vrams=_detect_vrams()
 tv=sum(vrams)
 TM={0:('<B',1),1:('<b',1),2:('<H',2),3:('<h',2),4:('<I',4),5:('<i',4),6:('<f',4),7:('<?',1),8:(None,None),9:(None,None),10:('<Q',8),11:('<q',8),12:('<d',8)}
 rs=lambda f:f.read(struct.unpack('<Q',f.read(8))[0]).decode('utf-8','replace')
