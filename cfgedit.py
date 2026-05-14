@@ -3,11 +3,19 @@ import urllib.parse,urllib.request,os,json,http.client,subprocess,sys,threading
 CONFIG='/app/config.yaml'
 STATUS='/tmp/serve_status.json'
 DOWNLOADER_FILE='/app/downloader'
+DEFAULT_MODEL_FILE='/app/default_model'
 LLAMA_SWAP_HOST='localhost'; LLAMA_SWAP_PORT=8080
 SCRIPTS_BASE='https://raw.githubusercontent.com/klutzydrummer/vastai-llmrunner/main'
 SCRIPTS=['serve.py','cfgedit.py','guard.py','cfginit.py','init.sh']
 LOGS={'guard':'/tmp/guard.log','llama-swap':'/tmp/llama-swap.log',
       'caddy':'/tmp/caddy.log','cfgedit':'/tmp/cfgedit.log','cloudflared':'/tmp/cloudflared.log'}
+
+def get_model_ids():
+    try:
+        import re
+        return [m.group(1) for line in open(CONFIG)
+                for m in [re.match(r"^\s{2}'(.+)':\s*$",line)] if m]
+    except: return []
 
 def tail(path,n=300):
     try:
@@ -75,6 +83,8 @@ class H(BaseHTTPRequestHandler):
         elif self.path=='/downloader':
             cur=open(DOWNLOADER_FILE).read().strip() if os.path.exists(DOWNLOADER_FILE) else 'env default'
             self.ok(cur.encode())
+        elif self.path=='/default_model':
+            self.ok((open(DEFAULT_MODEL_FILE).read().strip() if os.path.exists(DEFAULT_MODEL_FILE) else '').encode())
         elif self.path=='/': self._ui()
         elif self.path=='/debug': self._debug_ui()
         elif self.path.startswith('/logfile'):
@@ -105,6 +115,11 @@ class H(BaseHTTPRequestHandler):
             if v: open(DOWNLOADER_FILE,'w').write(v)
             elif os.path.exists(DOWNLOADER_FILE): os.remove(DOWNLOADER_FILE)
             print(f'[cfgedit] downloader: {v or "cleared"}',flush=True);self.ok(b'OK\n')
+        elif self.path=='/default_model':
+            v=body.decode().strip()
+            if v: open(DEFAULT_MODEL_FILE,'w').write(v)
+            elif os.path.exists(DEFAULT_MODEL_FILE): os.remove(DEFAULT_MODEL_FILE)
+            print(f'[cfgedit] default_model: {v or "cleared"}',flush=True);self.ok(b'OK\n')
         elif self.path=='/update':
             self.ok(b'OK\n')
             threading.Thread(target=update_scripts,daemon=True).start()
@@ -112,11 +127,16 @@ class H(BaseHTTPRequestHandler):
     def _ui(self):
         d=open(CONFIG,'r').read().replace('&','&amp;').replace('<','&lt;')
         cur=open(DOWNLOADER_FILE).read().strip() if os.path.exists(DOWNLOADER_FILE) else ''
+        cur_dm=open(DEFAULT_MODEL_FILE).read().strip() if os.path.exists(DEFAULT_MODEL_FILE) else ''
+        model_ids=get_model_ids()
+        dm_opts=f'<option value="" {"selected" if not cur_dm else ""}>env default</option>'
+        dm_opts+=''.join(f'<option value="{m}" {"selected" if cur_dm==m else ""}>{m}</option>' for m in model_ids)
         html=f'''<!DOCTYPE html><html><head><meta charset=utf-8><title>llama-swap</title>
 <style>body{{font-family:monospace;margin:1em}}textarea{{width:100%;height:60vh;font-family:monospace;font-size:12px}}select,button{{margin:2px;padding:4px 10px;font-family:monospace}}#st{{padding:6px;background:#eee;margin-bottom:6px;font-size:13px}}small{{color:#888}}</style></head>
 <body><h3>llama-swap config.yaml</h3>
 <div id=st>...</div>
 <div>
+<label>Default model: <select id=dm onchange="setDM(this.value)">{dm_opts}</select></label>
 <label>Downloader: <select id=dl onchange="setDL(this.value)">
 <option value="" {"selected" if not cur else ""}>env default</option>
 <option value="aria2c" {"selected" if cur=="aria2c" else ""}>aria2c</option>
@@ -132,6 +152,7 @@ class H(BaseHTTPRequestHandler):
 <textarea id=cfg>{d}</textarea>
 <script>
 var M=document.getElementById('msg'),E='/editor';
+function setDM(v){{fetch(E+'/default_model',{{method:'POST',body:v}}).then(()=>M.textContent='✓ default model set')}}
 function setDL(v){{fetch(E+'/downloader',{{method:'POST',body:v}}).then(()=>M.textContent='✓ downloader set')}}
 function doUnload(){{fetch(E+'/unload',{{method:'POST'}}).then(()=>M.textContent='✓ unloaded')}}
 function doUpdate(){{M.textContent='updating...';fetch(E+'/update',{{method:'POST'}}).then(()=>{{M.textContent='restarting...';setTimeout(()=>location.reload(),3000)}}).catch(()=>{{M.textContent='restarting...';setTimeout(()=>location.reload(),3000)}})}}
