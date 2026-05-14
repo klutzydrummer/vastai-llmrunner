@@ -8,7 +8,15 @@ GEN_PATHS={'/v1/chat/completions','/v1/completions'}
 INFO_PATHS={'/v1/internal/model/info','/props','/slots'}
 STATUS='/tmp/serve_status.json'
 DEFAULT_MODEL=os.environ.get('DEFAULT_MODEL','')
+DEFAULT_MODEL_FILE='/app/default_model'
 _cache={}
+
+def get_default_model():
+    try:
+        v=open(DEFAULT_MODEL_FILE).read().strip()
+        if v: return v
+    except: pass
+    return DEFAULT_MODEL
 
 class ThreadedHTTPServer(ThreadingMixIn,HTTPServer):
     daemon_threads=True
@@ -33,9 +41,7 @@ def resolve_model(req_model):
     running=get_running()
     if running:
         return running
-    # Nothing loaded yet — use DEFAULT_MODEL so llama-swap loads the right
-    # model regardless of what the client sent (gpt-4, claude-*, etc.)
-    return DEFAULT_MODEL or req_model
+    return get_default_model() or req_model
 
 def load_props():
     try: return json.loads(open(STATUS).read())
