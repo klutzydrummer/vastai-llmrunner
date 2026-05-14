@@ -246,12 +246,16 @@ eb={'f16':2.0,'q8_0':1.0625,'q4_0':0.5,'q4_1':0.5625,'f32':4.0,'q5_0':0.625,'q5_
 wm=os.path.getsize(mp)/1048576*1.05
 pm2=os.path.getsize(mmp)/1048576*1.02 if mmp and os.path.isfile(mmp) else 0
 ndev=max(len(vrams),1);rem=(tv*0.88-wm-pm2)*1048576
-SAFETY=3.0;cpd=rem*cf/ndev
-ub_attn=math.sqrt(cpd/(nh*4*SAFETY));ub_ffn=cpd/(2*ffn*4*SAFETY)
-ub=2**int(math.log2(max(256,min(2048,min(ub_attn,ub_ffn)))))
+SAFETY=3.0;cpd=max(0.0,rem)*cf/ndev
+if cpd>0:
+    ub_attn=math.sqrt(cpd/(nh*4*SAFETY));ub_ffn=cpd/(2*ffn*4*SAFETY)
+    ub=2**int(math.log2(max(256,min(2048,min(ub_attn,ub_ffn)))))
+else:
+    print(f'[serve] warn: rem={rem/1048576:.0f}MB (model may exceed detected VRAM={tv:.0f}MB), using conservative defaults',flush=True)
+    ub=512
 kpt=2*nkv*nk*hd*eb;compute_total=ndev*max(nh*ub*ub*4,2*ffn*ub*4)*SAFETY
-kv_bytes=rem-compute_total
-ctx=int(os.environ.get('CTX_SIZE','0')) or max(512*par,(int(kv_bytes/kpt)//512)*512)
+kv_bytes=max(0,rem)-compute_total
+ctx=int(os.environ.get('CTX_SIZE','0')) or max(512*par,max(0,(int(kv_bytes/kpt)//512)*512))
 ub=int(os.environ.get('UBATCH_SIZE','0')) or ub
 # Vision models: non-causal attention requires ubatch >= image token count
 if mmp and os.path.isfile(mmp):
