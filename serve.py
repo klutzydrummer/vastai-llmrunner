@@ -2,6 +2,7 @@ import os,sys,struct,math,shutil,subprocess as sp,urllib.request,json,time
 PORT=sys.argv[1]
 MODEL_URL=os.environ['MODEL_URL']
 MMPROJ_URL=os.environ.get('MMPROJ_URL','')
+DRAFT_MODEL_URL=os.environ.get('DRAFT_MODEL_URL','')
 HF_TOKEN=os.environ.get('HF_TOKEN','')
 DOWNLOADER=os.environ.get('DOWNLOADER','aria2c')
 HF_BACKEND=os.environ.get('HF_BACKEND','hf_xet')
@@ -183,11 +184,14 @@ def dl(url,keep):
     return dest
 
 import hashlib as _hl
-keep={f'{MODEL_DIR}/{_hl.md5(u.encode()).hexdigest()[:8]}_{u.split("/")[-1]}' for u in [MODEL_URL,MMPROJ_URL] if u and u!='null'}
+keep={f'{MODEL_DIR}/{_hl.md5(u.encode()).hexdigest()[:8]}_{u.split("/")[-1]}' for u in [MODEL_URL,MMPROJ_URL,DRAFT_MODEL_URL] if u and u!='null'}
 mp=dl(MODEL_URL,keep)
 mmp=''
 if MMPROJ_URL and MMPROJ_URL not in ('','null'):
     mmp=dl(MMPROJ_URL,keep)
+dmp=''
+if DRAFT_MODEL_URL and DRAFT_MODEL_URL not in ('','null'):
+    dmp=dl(DRAFT_MODEL_URL,keep)
 
 def _detect_vrams(retries=5,delay=3):
     best=[];prev=None
@@ -266,7 +270,8 @@ par=int(os.environ.get('PARALLEL','1'));cf=float(os.environ.get('COMPUTE_FRACTIO
 eb={'f16':2.0,'q8_0':1.0625,'q4_0':0.5,'q4_1':0.5625,'f32':4.0,'q5_0':0.625,'q5_1':0.6875}.get(ct,2.0)
 wm=os.path.getsize(mp)/1048576*1.05
 pm2=os.path.getsize(mmp)/1048576*1.02 if mmp and os.path.isfile(mmp) else 0
-ndev=max(len(vrams),1);rem=(tv*0.88-wm-pm2)*1048576
+pdraft=os.path.getsize(dmp)/1048576*1.05 if dmp and os.path.isfile(dmp) else 0
+ndev=max(len(vrams),1);rem=(tv*0.88-wm-pm2-pdraft)*1048576
 SAFETY=3.0;cpd=max(0.0,rem)*cf/ndev
 if cpd>0:
     ub_attn=math.sqrt(cpd/(nh*4*SAFETY));ub_ffn=cpd/(2*ffn*4*SAFETY)
@@ -287,7 +292,7 @@ vram_used_mb=int(wm+pm2+ctx*kpt/1048576+compute_total/1048576)
 n_ctx_train=scalar(P('context_length',ctx))
 print(f'[serve] arch={arch} nl={nl} nkv={nkv} nh={nh} nk={nk} hd={hd} ffn={ffn}',flush=True)
 print(f'[serve] ctx={ctx} per_slot={ctx//par} batch={batch} ubatch={ub} par={par}',flush=True)
-print(f'[serve] weights={wm:.0f}MB mmproj={pm2:.0f}MB kv={ctx*kpt/1048576:.0f}MB compute~{compute_total/1048576:.0f}MB',flush=True)
+print(f'[serve] weights={wm:.0f}MB mmproj={pm2:.0f}MB draft={pdraft:.0f}MB kv={ctx*kpt/1048576:.0f}MB compute~{compute_total/1048576:.0f}MB',flush=True)
 write_status({'status':'loading','model':os.path.basename(mp),'ctx':ctx,'n_ctx_train':n_ctx_train,'n_ctx_per_slot':ctx//par,'vram_mb':vram_used_mb,'par':par,'port':int(PORT),'ts':int(time.time())})
 args=['--model',mp,'--ctx-size',str(ctx),'--batch-size',str(batch),'--ubatch-size',str(ub),'--parallel',str(par)]
 args+=['--host','0.0.0.0','--port',PORT]
@@ -295,6 +300,8 @@ args+=['--cache-type-k',ct,'--cache-type-v',ctv]
 if mmp and os.path.isfile(mmp):args+=['--mmproj',mmp]
 if os.environ.get('IMAGE_MIN_TOKENS'):args+=['--image-min-tokens',os.environ['IMAGE_MIN_TOKENS']]
 if os.environ.get('IMAGE_MAX_TOKENS'):args+=['--image-max-tokens',os.environ['IMAGE_MAX_TOKENS']]
+if dmp and os.path.isfile(dmp):args+=['--draft-model',dmp]
+if os.environ.get('DRAFT_N'):args+=['--draft',os.environ['DRAFT_N']]
 if os.environ.get('MLOCK','0')=='1':args+=['--mlock']
 if len(vrams)>1:
     total=sum(vrams);split=','.join(f'{v/total:.4f}' for v in vrams)
@@ -303,7 +310,7 @@ else:
     args+=['--gpu-layers',os.environ.get('GPU_LAYERS','99')]
 binary=find_binary()
 print(f'[serve] exec {binary} {args}',flush=True)
-for _p in [mp]+([mmp] if mmp and os.path.isfile(mmp) else []):
+for _p in [mp]+([mmp] if mmp and os.path.isfile(mmp) else [])+([dmp] if dmp and os.path.isfile(dmp) else []):
     try: open(_p+'.pid','w').write(str(os.getpid()))
     except: pass
 os.execv(binary,[binary]+args)
