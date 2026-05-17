@@ -11,6 +11,7 @@ for sfx in suffixes:
     if not MU:
         break
     MMU = os.environ.get(f"MMPROJ_URL{sfx}", "")
+    DMU = os.environ.get(f"DRAFT_MODEL_URL{sfx}", "")
     MN = MU.split("/")[-1].replace(".gguf", "")
     found += 1
     for par in [1, 2, 4, 8]:
@@ -21,6 +22,8 @@ for sfx in suffixes:
         lines.append(f'      - "MODEL_URL={MU}"')
         if MMU:
             lines.append(f'      - "MMPROJ_URL={MMU}"')
+        if DMU:
+            lines.append(f'      - "DRAFT_MODEL_URL={DMU}"')
         for k in PASS_KEYS:
             v = os.environ.get(k)
             if v:
