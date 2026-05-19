@@ -22,10 +22,13 @@ install_pip_deps(){
 # get_latest_tag REPO  →  prints tag (e.g. v211, 2026.3.0)
 get_latest_tag(){
     local repo="$1"
-    local loc
-    loc=$(curl -sfI "https://github.com/${repo}/releases/latest" \
+    local loc tag
+    loc=$(curl -sfI --connect-timeout 15 --max-time 30 \
+          "https://github.com/${repo}/releases/latest" \
           | grep -i '^location:' | tr -d '\r' | sed 's/.*location: //')
-    echo "${loc##*/}"   # last path segment = tag
+    tag="${loc##*/}"
+    [ -n "$tag" ] || return 1
+    echo "$tag"
 }
 
 # download_bin NAME REPO TAG_TO_VER_FN ASSET_FN IS_TAR
@@ -57,13 +60,13 @@ download_bin(){
     tmp=$(mktemp -d)
 
     if [ "$is_tar" = "true" ]; then
-        curl -fsSL --retry 3 --retry-delay 2 "$url" | tar xz -C "$tmp" \
+        curl -fsSL --connect-timeout 15 --retry 3 --retry-delay 2 "$url" | tar xz -C "$tmp" \
             || { rm -rf "$tmp"; die "download/extract failed for $name ($url)"; }
         [ -f "$tmp/$name" ] \
             || die "$name not found in archive (got: $(ls "$tmp"))"
         mv "$tmp/$name" /usr/local/bin/"$name"
     else
-        curl -fsSL --retry 3 --retry-delay 2 -o "$tmp/$name" "$url" \
+        curl -fsSL --connect-timeout 15 --retry 3 --retry-delay 2 -o "$tmp/$name" "$url" \
             || { rm -rf "$tmp"; die "download failed for $name ($url)"; }
         mv "$tmp/$name" /usr/local/bin/"$name"
     fi
