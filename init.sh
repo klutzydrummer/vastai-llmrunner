@@ -60,13 +60,15 @@ download_bin(){
     tmp=$(mktemp -d)
 
     if [ "$is_tar" = "true" ]; then
-        curl -fsSL --connect-timeout 15 --retry 3 --retry-delay 2 "$url" | tar xz -C "$tmp" \
+        curl -fsSL --connect-timeout 15 --speed-limit 1 --speed-time 60 \
+             --retry 3 --retry-delay 2 "$url" | tar xz -C "$tmp" \
             || { rm -rf "$tmp"; die "download/extract failed for $name ($url)"; }
         [ -f "$tmp/$name" ] \
             || die "$name not found in archive (got: $(ls "$tmp"))"
         mv "$tmp/$name" /usr/local/bin/"$name"
     else
-        curl -fsSL --connect-timeout 15 --retry 3 --retry-delay 2 -o "$tmp/$name" "$url" \
+        curl -fsSL --connect-timeout 15 --speed-limit 1 --speed-time 60 \
+             --retry 3 --retry-delay 2 -o "$tmp/$name" "$url" \
             || { rm -rf "$tmp"; die "download failed for $name ($url)"; }
         mv "$tmp/$name" /usr/local/bin/"$name"
     fi
