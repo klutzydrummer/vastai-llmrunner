@@ -9,6 +9,9 @@ _dl_override='/app/downloader'
 if os.path.isfile(_dl_override):
     _v=open(_dl_override).read().strip()
     if _v: DOWNLOADER=_v
+# aria2c exit codes where retrying is pointless
+_FATAL_ARIA2C_CODES=frozenset({3,9,17,18,25})  # 404, disk full, bad auth, file open, no-resume
+DOWNLOAD_MAX_ATTEMPTS=int(os.environ.get('DOWNLOAD_MAX_ATTEMPTS','10'))
 MODEL_DIR='/models'
 STATUS='/tmp/serve_status.json'
 os.makedirs(MODEL_DIR,exist_ok=True)
@@ -16,6 +19,12 @@ os.makedirs(MODEL_DIR,exist_ok=True)
 def write_status(d):
     try: open(STATUS,'w').write(json.dumps(d))
     except: pass
+
+def _try_remove(*paths):
+    for p in paths:
+        try:
+            if os.path.exists(p): os.remove(p)
+        except: pass
 
 def remote_size(url):
     try:
@@ -138,45 +147,67 @@ def dl(url,keep):
         if rc<0: raise StallError(f'download stalled after {stall_timeout}s of silence')
         if rc!=0: raise sp.CalledProcessError(rc,cmd)
 
-    try:
-        if DOWNLOADER=='hf':
-            rem=url.removeprefix('https://huggingface.co/')
-            parts=rem.split('/'); repo='/'.join(parts[:2]); rev=parts[3]; fname='/'.join(parts[4:])
-            if HF_BACKEND=='hf_transfer':
-                os.environ['HF_HUB_ENABLE_HF_TRANSFER']='1'
+    delay=30; last_exc=None
+    for attempt in range(1,DOWNLOAD_MAX_ATTEMPTS+1):
+        if attempt>1:
+            print(f'[serve] attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS}: {name}',flush=True)
+            write_status({'status':'downloading','model':name,'size_mb':sz_mb,
+                          'attempt':attempt,'ts':int(time.time())})
+        try:
+            if DOWNLOADER=='hf':
+                rem=url.removeprefix('https://huggingface.co/')
+                parts=rem.split('/'); repo='/'.join(parts[:2]); rev=parts[3]; fname='/'.join(parts[4:])
+                if HF_BACKEND=='hf_transfer':
+                    os.environ['HF_HUB_ENABLE_HF_TRANSFER']='1'
+                else:
+                    os.environ['HF_XET_HIGH_PERFORMANCE']='1'
+                cmd=['hf','download',repo,fname,'--revision',rev,'--local-dir',MODEL_DIR]
+                if HF_TOKEN: cmd+=['--token',HF_TOKEN]
+                run_streaming(cmd)
+                # hf downloads to raw filename; rename to hash-prefixed dest
+                raw_dest=f'{MODEL_DIR}/{name}'
+                if raw_dest!=dest and os.path.isfile(raw_dest) and not os.path.isfile(dest):
+                    os.rename(raw_dest,dest)
             else:
-                os.environ['HF_XET_HIGH_PERFORMANCE']='1'
-            cmd=['hf','download',repo,fname,'--revision',rev,'--local-dir',MODEL_DIR]
-            if HF_TOKEN: cmd+=['--token',HF_TOKEN]
-            run_streaming(cmd)
-            # hf downloads to raw filename; rename to hash-prefixed dest
-            raw_dest=f'{MODEL_DIR}/{name}'
-            if raw_dest!=dest and os.path.isfile(raw_dest) and not os.path.isfile(dest):
-                os.rename(raw_dest,dest)
-        else:
-            cmd=['aria2c','-x16','-s16','-k10M','--file-allocation=none',
-                 '--summary-interval=30','--show-console-readout=false',
-                 '-d',MODEL_DIR,'-o',os.path.basename(dest),url]
-            if HF_TOKEN: cmd+=[f'--header=Authorization: Bearer {HF_TOKEN}']
-            run_streaming(cmd)
-    except StallError as e:
-        # Preserve partial files — aria2c can resume from .aria2 control file
-        msg=f'[serve] STALLED: {name} — {e}'
-        if DOWNLOADER=='hf':
-            msg+='. Switch to aria2c downloader at tunnel/editor/'
-        print(msg,flush=True)
-        write_status({'status':'error','model':name,'error':str(e),'stalled':True,'ts':int(time.time())})
-        raise
-    except Exception as e:
-        # Real failure — delete partial files so next request starts clean
-        for partial in [dest,f'{dest}.aria2']:
-            try:
-                if os.path.exists(partial): os.remove(partial)
-            except: pass
-        msg=f'[serve] ERROR downloading {name}: {e}'
-        print(msg,flush=True)
-        write_status({'status':'error','model':name,'error':str(e),'ts':int(time.time())})
-        raise
+                cmd=['aria2c','-x16','-s16','-k10M','--file-allocation=none',
+                     '--summary-interval=30','--show-console-readout=false',
+                     '-d',MODEL_DIR,'-o',os.path.basename(dest),url]
+                if HF_TOKEN: cmd+=[f'--header=Authorization: Bearer {HF_TOKEN}']
+                run_streaming(cmd)
+            last_exc=None; break  # success
+
+        except StallError as e:
+            last_exc=e
+            if attempt>=DOWNLOAD_MAX_ATTEMPTS:
+                _try_remove(dest,f'{dest}.aria2'); break
+            if attempt==DOWNLOAD_MAX_ATTEMPTS-1:
+                # penultimate attempt: clear control file so next is a fresh start
+                _try_remove(f'{dest}.aria2')
+                print(f'[serve] STALL attempt {attempt}: cleared control file, fresh start next',flush=True)
+            else:
+                print(f'[serve] STALL attempt {attempt}: resuming in {delay}s',flush=True)
+            write_status({'status':'retrying','model':name,'attempt':attempt,
+                          'max_attempts':DOWNLOAD_MAX_ATTEMPTS,'reason':'stall',
+                          'retry_in':delay,'ts':int(time.time())})
+            time.sleep(delay); delay=min(delay*2,300)
+
+        except sp.CalledProcessError as e:
+            last_exc=e; rc=e.returncode
+            if DOWNLOADER=='hf' or rc in _FATAL_ARIA2C_CODES or attempt>=DOWNLOAD_MAX_ATTEMPTS:
+                _try_remove(dest,f'{dest}.aria2'); break
+            print(f'[serve] error attempt {attempt} (rc={rc}): retrying in {delay}s',flush=True)
+            write_status({'status':'retrying','model':name,'attempt':attempt,
+                          'max_attempts':DOWNLOAD_MAX_ATTEMPTS,'reason':f'exit {rc}',
+                          'retry_in':delay,'ts':int(time.time())})
+            time.sleep(delay); delay=min(delay*2,300)
+
+        except Exception as e:
+            last_exc=e; _try_remove(dest,f'{dest}.aria2'); break  # unexpected — don't retry
+
+    if last_exc is not None:
+        print(f'[serve] ERROR downloading {name}: {last_exc}',flush=True)
+        write_status({'status':'error','model':name,'error':str(last_exc),'ts':int(time.time())})
+        raise last_exc
     final_mb=os.path.getsize(dest)//1048576 if os.path.isfile(dest) else sz_mb
     print(f'[serve] downloaded: {name} ({final_mb}MB)',flush=True)
     write_status({'status':'downloaded','model':name,'size_mb':final_mb,'ts':int(time.time())})
