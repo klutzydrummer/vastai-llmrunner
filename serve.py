@@ -145,7 +145,9 @@ def dl(url,keep):
         wt.join(timeout=1)
         if buf.strip(): print(f'[dl] {buf.decode("utf-8","replace").strip()}',flush=True)
         if rc<0: raise StallError(f'download stalled after {stall_timeout}s of silence')
-        if rc!=0: raise sp.CalledProcessError(rc,cmd)
+        if rc!=0:
+            safe=[c if not c.startswith('--header=Authorization') else '--header=Authorization: Bearer [REDACTED]' for c in cmd]
+            raise sp.CalledProcessError(rc,safe)
 
     delay=30; last_exc=None
     for attempt in range(1,DOWNLOAD_MAX_ATTEMPTS+1):
