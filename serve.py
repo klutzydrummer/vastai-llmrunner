@@ -268,7 +268,7 @@ def pg(path):
                 if k=='general.architecture':arch=rv(f,vt);break
                 else:sv(f,vt)
             except:break
-    W={f'{arch}.{s}' for s in ['block_count','attention.head_count','attention.head_count_kv','embedding_length','feed_forward_length','attention.layer_count','context_length']}
+    W={f'{arch}.{s}' for s in ['block_count','attention.head_count','attention.head_count_kv','embedding_length','feed_forward_length','attention.layer_count','context_length','mtp_depth']}
     meta={'general.architecture':arch}
     with open(path,'rb') as f:
         f.read(4);f.read(4);f.read(8);kv=struct.unpack('<Q',f.read(8))[0]
@@ -332,6 +332,17 @@ if len(vrams)>1:
     args+=['--tensor-split',split,'--gpu-layers','999']
 else:
     args+=['--gpu-layers',os.environ.get('GPU_LAYERS','99')]
+mtp_depth=int(meta.get(f'{arch}.mtp_depth',0) or 0)
+mtp_env=os.environ.get('MTP_DRAFT_MAX','')
+if mtp_env:
+    draft_n=int(mtp_env)
+elif mtp_depth>0:
+    draft_n=mtp_depth
+else:
+    draft_n=0
+if draft_n>0:
+    print(f'[serve] MTP: arch={arch} mtp_depth={mtp_depth} draft_n={draft_n}',flush=True)
+    args+=['--spec-type','draft-mtp','--spec-draft-n-max',str(draft_n)]
 binary=find_binary()
 print(f'[serve] exec {binary} {args}',flush=True)
 for _p in [mp]+([mmp] if mmp and os.path.isfile(mmp) else []):
