@@ -22,10 +22,12 @@ install_pip_deps(){
 # get_latest_tag REPO  →  prints tag (e.g. v211, 2026.3.0)
 get_latest_tag(){
     local repo="$1"
-    local loc
-    loc=$(curl -sfI "https://github.com/${repo}/releases/latest" \
-          | grep -i '^location:' | tr -d '\r' | sed 's/.*location: //')
-    echo "${loc##*/}"   # last path segment = tag
+    local url
+    url=$(curl -sfL --max-time 30 -o /dev/null -w '%{url_effective}' \
+          "https://github.com/${repo}/releases/latest")
+    local tag="${url##*/}"
+    [ -n "$tag" ] || return 1
+    echo "$tag"
 }
 
 # download_bin NAME REPO TAG_TO_VER_FN ASSET_FN IS_TAR
