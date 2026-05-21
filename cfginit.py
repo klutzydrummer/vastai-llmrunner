@@ -27,6 +27,7 @@ for sfx in suffixes:
                 lines.append(f'      - "{k}={v}"')
         lines.append(f'      - "PARALLEL={par}"')
         lines.append(f"    cmd: python3 /tmp/serve.py ${{PORT}}")
+        lines.append(f"    logFile: /tmp/serve-{mid}.log")
 
 open("/app/config.yaml", "w").write("\n".join(lines) + "\n")
 print(f"[init] wrote /app/config.yaml with {found} model(s)", flush=True)

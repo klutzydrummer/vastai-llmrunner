@@ -151,8 +151,13 @@ class H(BaseHTTPRequestHandler):
 </div>
 <small>p1=max ctx single user | p2/p4=split ctx | p8=may OOM on single GPU</small><br>
 <textarea id=cfg>{d}</textarea>
+<details id=sd><summary style="cursor:pointer;user-select:none;margin-top:4px">&#9658; Model output (serve &middot; aria2c &middot; llama-server)</summary>
+<div style="margin:2px 0"><button id=slpb onclick="slPaused=!slPaused;this.textContent=slPaused?'&#9654; Resume':'&#9208; Pause'" style="margin:2px;padding:2px 8px;font-family:monospace">&#9208; Pause</button>
+<label><input type=checkbox id=slas checked> auto-scroll</label></div>
+<pre id=slog style="background:#111;color:#0f0;padding:6px;height:25vh;overflow-y:auto;font-size:11px;white-space:pre-wrap;word-break:break-all;margin:2px 0">(no model running)</pre>
+</details>
 <script>
-var M=document.getElementById('msg'),E='/editor',lastSaveTs=0;
+var M=document.getElementById('msg'),E='/editor',lastSaveTs=0,slPaused=false;
 function setDM(v){{fetch(E+'/default_model',{{method:'POST',body:v}}).then(()=>M.textContent='✓ default model set')}}
 function setDL(v){{fetch(E+'/downloader',{{method:'POST',body:v}}).then(()=>M.textContent='✓ downloader set')}}
 function doUnload(){{fetch(E+'/unload',{{method:'POST'}}).then(()=>M.textContent='✓ unloaded')}}
@@ -171,6 +176,14 @@ function poll(){{
     txt+=age(s.ts);
     el.style.background={{'error':'#fee','ready':'#dfd','downloading':'#e8f0fe','loading':'#e8f0fe','retrying':'#fff3cd'}}[st]||'#eee';
     el.textContent=txt;
+    var logModel=m||(s.model||'');
+    if(logModel&&!slPaused){{
+      fetch(E+'/logfile?name='+encodeURIComponent('serve-'+logModel+'.log'))
+      .then(r=>r.text()).then(t=>{{
+        var p=document.getElementById('slog');
+        if(p){{p.textContent=t||'(log empty)';if(document.getElementById('slas').checked)p.scrollTop=p.scrollHeight;}}
+      }}).catch(()=>{{}});
+    }}
   }}).catch(()=>{{}})
 }}
 poll();setInterval(poll,2000);
