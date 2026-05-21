@@ -5,6 +5,36 @@ LOG(){ echo "[$(date '+%H:%M:%S')] [init] $*"; }
 ERR(){ echo "[$(date '+%H:%M:%S')] [init] ERROR: $*" >&2; }
 die(){ ERR "$*"; exit 1; }
 
+# retry MAX INITIAL_DELAY_SECS CMD [ARGS...]  — exponential backoff wrapper
+retry(){
+    local max="$1" delay="$2"; shift 2
+    local n=1
+    while true; do
+        if "$@"; then return 0; fi
+        if (( n >= max )); then ERR "retry: \"$*\" failed after $max attempts"; return 1; fi
+        ERR "retry: attempt $n/$max for \"$*\" failed, retrying in ${delay}s"
+        sleep "$delay"
+        delay=$(( delay * 2 ))
+        n=$(( n + 1 ))
+    done
+}
+
+# wait_port NAME PORT [TIMEOUT_SECS]  — block until port accepts connections
+wait_port(){
+    local name="$1" port="$2" timeout="${3:-30}"
+    local deadline=$(( SECONDS + timeout ))
+    LOG "waiting for $name on :$port (${timeout}s)"
+    while (( SECONDS < deadline )); do
+        (echo > /dev/tcp/localhost/"$port") 2>/dev/null && {
+            LOG "$name is up on :$port"; return 0
+        }
+        sleep 1
+    done
+    ERR "$name did not bind :$port within ${timeout}s"
+    [ -f "/tmp/${name}.log" ] && tail -20 "/tmp/${name}.log" >&2
+    return 1
+}
+
 # ── pip deps ──────────────────────────────────────────────────────────────────
 install_pip_deps(){
     if [ "${DOWNLOADER:-aria2c}" = "hf" ]; then
@@ -22,13 +52,27 @@ install_pip_deps(){
 # get_latest_tag REPO  →  prints tag (e.g. v211, 2026.3.0)
 get_latest_tag(){
     local repo="$1"
-    local loc
-    loc=$(curl -sfI "https://github.com/${repo}/releases/latest" \
-          | grep -i '^location:' | tr -d '\r' | sed 's/.*location: //')
-    echo "${loc##*/}"   # last path segment = tag
+    local url tag json
+
+    # Strategy 1: follow redirect, validate result looks like a version
+    url=$(curl -sfL --max-time 30 -o /dev/null -w '%{url_effective}' \
+          "https://github.com/${repo}/releases/latest" 2>/dev/null) || true
+    tag="${url##*/}"
+    [[ "$tag" =~ ^v?[0-9] ]] && { echo "$tag"; return 0; }
+
+    # Strategy 2: GitHub JSON API
+    LOG "get_latest_tag: redirect failed for $repo, trying JSON API"
+    json=$(curl -sfL --max-time 30 \
+          "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null) || true
+    tag=$(printf '%s' "$json" | grep -o '"tag_name":"[^"]*"' \
+          | sed 's/"tag_name":"//;s/"//') || true
+    [[ "${tag:-}" =~ ^v?[0-9] ]] && { echo "$tag"; return 0; }
+
+    ERR "get_latest_tag: both strategies failed for $repo"
+    return 1
 }
 
-# download_bin NAME REPO TAG_TO_VER_FN ASSET_FN IS_TAR
+# download_bin NAME REPO TAG_TO_VER_SED ASSET_TPL IS_TAR
 #   NAME         binary name in PATH
 #   REPO         e.g. mostlygeek/llama-swap
 #   TAG_TO_VER   sed expression to strip prefix (e.g. 's/^v//')
@@ -37,8 +81,8 @@ get_latest_tag(){
 download_bin(){
     local name="$1"
     local repo="$2"
-    local tag_strip="$3"    # sed expr: 's/^v//'
-    local asset_tpl="$4"    # e.g. 'llama-swap_VER_linux_amd64.tar.gz'
+    local tag_strip="$3"
+    local asset_tpl="$4"
     local is_tar="${5:-true}"
 
     if command -v "$name" >/dev/null 2>&1; then
@@ -47,8 +91,9 @@ download_bin(){
     fi
 
     LOG "resolving latest release for $repo"
-    local tag ver asset url tmp
-    tag=$(get_latest_tag "$repo") || die "could not resolve latest tag for $repo"
+    local tag ver asset url tmp archive
+    tag=$(retry 3 5 get_latest_tag "$repo") \
+        || die "could not resolve latest tag for $repo after retries"
     ver=$(echo "$tag" | sed "$tag_strip")
     asset=$(echo "$asset_tpl" | sed "s/TAG/$tag/g; s/VER/$ver/g")
     url="https://github.com/${repo}/releases/download/${tag}/${asset}"
@@ -57,13 +102,16 @@ download_bin(){
     tmp=$(mktemp -d)
 
     if [ "$is_tar" = "true" ]; then
-        curl -fsSL --retry 3 --retry-delay 2 "$url" | tar xz -C "$tmp" \
-            || { rm -rf "$tmp"; die "download/extract failed for $name ($url)"; }
+        archive="$tmp/archive.tar.gz"
+        curl -fsSL --max-time 300 --retry 3 --retry-delay 5 -o "$archive" "$url" \
+            || { rm -rf "$tmp"; die "download failed for $name ($url)"; }
+        tar xz -C "$tmp" -f "$archive" \
+            || { rm -rf "$tmp"; die "extract failed for $name"; }
         [ -f "$tmp/$name" ] \
             || die "$name not found in archive (got: $(ls "$tmp"))"
         mv "$tmp/$name" /usr/local/bin/"$name"
     else
-        curl -fsSL --retry 3 --retry-delay 2 -o "$tmp/$name" "$url" \
+        curl -fsSL --max-time 120 --retry 3 --retry-delay 5 -o "$tmp/$name" "$url" \
             || { rm -rf "$tmp"; die "download failed for $name ($url)"; }
         mv "$tmp/$name" /usr/local/bin/"$name"
     fi
@@ -100,10 +148,12 @@ start_services(){
     LOG "starting cfgedit"
     python3 /tmp/cfgedit.py > /tmp/cfgedit.log 2>&1 &
     CFGEDIT_PID=$!
+    wait_port cfgedit 5005 30 || die "cfgedit failed to bind port 5005"
 
     LOG "starting guard"
     python3 /tmp/guard.py > /tmp/guard.log 2>&1 &
     GUARD_PID=$!
+    wait_port guard 8081 30 || die "guard failed to bind port 8081"
 
     LOG "starting llama-swap"
     llama-swap --config /app/config.yaml --listen 0.0.0.0:8080 --watch-config \
@@ -135,6 +185,7 @@ CADDY
     LOG "starting caddy"
     caddy run --config /tmp/Caddyfile > /tmp/caddy.log 2>&1 &
     CADDY_PID=$!
+    wait_port caddy 5000 30 || die "caddy failed to bind port 5000"
 }
 
 # ── health wait ───────────────────────────────────────────────────────────────
@@ -175,16 +226,41 @@ preload_model(){
 }
 
 # ── tunnel ────────────────────────────────────────────────────────────────────
-start_tunnel(){
+_launch_cloudflared(){
     if [ -n "${CLOUDFLARE_TOKEN:-}" ]; then
         LOG "starting cloudflared tunnel (named)"
-        cloudflared tunnel run --token "$CLOUDFLARE_TOKEN" 2>&1 | tee /tmp/cloudflared.log &
+        cloudflared tunnel run --token "$CLOUDFLARE_TOKEN" >> /tmp/cloudflared.log 2>&1 &
     else
         LOG "starting cloudflared tunnel (quick)"
-        cloudflared tunnel --url http://localhost:5000 2>&1 | tee /tmp/cloudflared.log &
+        cloudflared tunnel --url http://localhost:5000 >> /tmp/cloudflared.log 2>&1 &
     fi
     TUNNEL_PID=$!
-    wait $TUNNEL_PID
+}
+
+tunnel_watchdog(){
+    local max_restarts=10 restarts=0
+    _launch_cloudflared
+    LOG "cloudflared started (pid=$TUNNEL_PID)"
+
+    while kill -0 "$LLAMA_SWAP_PID" 2>/dev/null; do
+        if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+            restarts=$(( restarts + 1 ))
+            if (( restarts > max_restarts )); then
+                ERR "cloudflared died $max_restarts times; continuing without tunnel"
+                break
+            fi
+            ERR "cloudflared exited unexpectedly (restart $restarts/$max_restarts)"
+            tail -5 /tmp/cloudflared.log >&2
+            sleep 5
+            _launch_cloudflared
+            LOG "cloudflared restarted (pid=$TUNNEL_PID)"
+        fi
+        sleep 5
+    done
+
+    ERR "llama-swap (pid=$LLAMA_SWAP_PID) has exited — shutting down"
+    tail -20 /tmp/llama-swap.log >&2
+    exit 1
 }
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -220,7 +296,7 @@ main(){
     start_services
     wait_healthy
     preload_model
-    start_tunnel
+    tunnel_watchdog
 }
 
 main

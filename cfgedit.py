@@ -145,6 +145,7 @@ class H(BaseHTTPRequestHandler):
 <button onclick="doUnload()">Unload</button>
 <button onclick="doSave()">Save &amp; Reload</button>
 <button onclick="doUpdate()">Update Scripts</button>
+<a href="/ui" target="_blank"><button type=button>llama-swap UI</button></a>
 <a href="/editor/debug" target="_blank"><button type=button>Logs / Debug</button></a>
 <span id=msg style="font-size:12px;color:#888"></span>
 </div>
