@@ -152,21 +152,25 @@ class H(BaseHTTPRequestHandler):
 <small>p1=max ctx single user | p2/p4=split ctx | p8=may OOM on single GPU</small><br>
 <textarea id=cfg>{d}</textarea>
 <script>
-var M=document.getElementById('msg'),E='/editor';
+var M=document.getElementById('msg'),E='/editor',lastSaveTs=0;
 function setDM(v){{fetch(E+'/default_model',{{method:'POST',body:v}}).then(()=>M.textContent='✓ default model set')}}
 function setDL(v){{fetch(E+'/downloader',{{method:'POST',body:v}}).then(()=>M.textContent='✓ downloader set')}}
 function doUnload(){{fetch(E+'/unload',{{method:'POST'}}).then(()=>M.textContent='✓ unloaded')}}
 function doUpdate(){{M.textContent='updating...';fetch(E+'/update',{{method:'POST'}}).then(()=>{{M.textContent='restarting...';setTimeout(()=>location.reload(),3000)}}).catch(()=>{{M.textContent='restarting...';setTimeout(()=>location.reload(),3000)}})}}
-function doSave(){{M.textContent='saving...';fetch(E+'/config',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:'cfg='+encodeURIComponent(document.getElementById('cfg').value)}}).then(r=>M.textContent=r.ok?'✓ saved':'✗ '+r.status)}}
+function doSave(){{M.textContent='saving...';lastSaveTs=Date.now()/1000;fetch(E+'/config',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:'cfg='+encodeURIComponent(document.getElementById('cfg').value)}}).then(r=>M.textContent=r.ok?'✓ saved':'✗ '+r.status)}}
+function age(ts){{if(!ts)return'';var d=Math.floor(Date.now()/1000-ts);if(d<5)return' (just now)';if(d<60)return' ('+d+'s ago)';if(d<3600)return' ('+Math.floor(d/60)+'m ago)';return' ('+Math.floor(d/3600)+'h ago)';}}
 function poll(){{
   Promise.all([fetch(E+'/status').then(r=>r.json()),fetch(E+'/running').then(r=>r.json())])
   .then(([s,r])=>{{
-    var st=s.status||'idle',m=r.model,txt=st;
+    var st=s.status||'idle',m=r.model,txt=st,el=document.getElementById('st');
     if(m)txt='ready — '+m;
     else if(st=='downloading')txt='downloading '+(s.pct||0)+'% '+s.model;
     else if(st=='loading')txt='loading ctx='+s.ctx+' — '+s.model;
-    else if(st=='error')txt='error: '+s.error;
-    document.getElementById('st').textContent=txt;
+    else if(st=='retrying')txt='retrying '+s.model+' (attempt '+s.attempt+'/'+s.max_attempts+', '+s.reason+')';
+    else if(st=='error'){{txt='error: '+s.error;if(s.ts&&s.ts<lastSaveTs)txt+=' — stale (before last save)';}}
+    txt+=age(s.ts);
+    el.style.background={{'error':'#fee','ready':'#dfd','downloading':'#e8f0fe','loading':'#e8f0fe','retrying':'#fff3cd'}}[st]||'#eee';
+    el.textContent=txt;
   }}).catch(()=>{{}})
 }}
 poll();setInterval(poll,2000);
