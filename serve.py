@@ -357,4 +357,6 @@ print(f'[serve] exec {binary} {args}',flush=True)
 for _p in [mp]+([mmp] if mmp and os.path.isfile(mmp) else [])+([dmp] if dmp and os.path.isfile(dmp) else []):
     try: open(_p+'.pid','w').write(str(os.getpid()))
     except: pass
+_lib_dir=os.path.dirname(os.path.realpath(binary))
+os.environ['LD_LIBRARY_PATH']=_lib_dir+(':'+os.environ['LD_LIBRARY_PATH'] if os.environ.get('LD_LIBRARY_PATH') else '')
 os.execv(binary,[binary]+args)
