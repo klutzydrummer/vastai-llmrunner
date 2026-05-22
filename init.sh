@@ -35,6 +35,21 @@ wait_port(){
     return 1
 }
 
+# ── script auto-update ────────────────────────────────────────────────────────
+update_scripts(){
+    local base="https://raw.githubusercontent.com/klutzydrummer/vastai-llmrunner/main"
+    local f failed=0
+    for f in serve.py cfginit.py cfgedit.py guard.py; do
+        if curl -fsSL --max-time 30 "$base/$f" -o "/tmp/$f"; then
+            LOG "updated $f"
+        else
+            LOG "warn: could not update $f (keeping existing)"
+            failed=$(( failed + 1 ))
+        fi
+    done
+    return "$failed"
+}
+
 # ── pip deps ──────────────────────────────────────────────────────────────────
 install_pip_deps(){
     LOG "installing websockets"
@@ -272,6 +287,8 @@ tunnel_watchdog(){
 main(){
     LOG "=== init start ==="
     mkdir -p /app /models
+
+    update_scripts || LOG "warn: some scripts failed to update, continuing with existing versions"
 
     install_pip_deps
 
