@@ -248,7 +248,7 @@ document.getElementById('td').addEventListener('toggle',function(e){{
 function initTerm(){{
   var div=document.getElementById('termbox');
   try{{
-    var term=new Terminal({{cursorBlink:true,fontSize:13,fontFamily:'monospace',theme:{{background:'#000'}}}});
+    var term=new Terminal({{cursorBlink:true,fontSize:13,fontFamily:'monospace',theme:{{background:'#000'}},copyOnSelect:true}});
     var fit=null;
     if(typeof FitAddon!=='undefined'){{fit=new FitAddon.FitAddon();term.loadAddon(fit);}}
     term.open(div);
