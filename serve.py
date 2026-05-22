@@ -333,8 +333,8 @@ args+=['--cache-type-k',ct,'--cache-type-v',ctv]
 if mmp and os.path.isfile(mmp):args+=['--mmproj',mmp]
 if os.environ.get('IMAGE_MIN_TOKENS'):args+=['--image-min-tokens',os.environ['IMAGE_MIN_TOKENS']]
 if os.environ.get('IMAGE_MAX_TOKENS'):args+=['--image-max-tokens',os.environ['IMAGE_MAX_TOKENS']]
-if dmp and os.path.isfile(dmp):args+=['--draft-model',dmp]
-if os.environ.get('DRAFT_N'):args+=['--draft',os.environ['DRAFT_N']]
+if dmp and os.path.isfile(dmp):args+=['--spec-draft-model',dmp]
+if os.environ.get('DRAFT_N'):args+=['--spec-draft-n-max',os.environ['DRAFT_N']]
 if os.environ.get('MLOCK','0')=='1':args+=['--mlock']
 if len(vrams)>1:
     total=sum(vrams);split=','.join(f'{v/total:.4f}' for v in vrams)
