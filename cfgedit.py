@@ -79,7 +79,7 @@ async def _terminal_ws_handler(websocket):
                             stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
                             close_fds=True, env=env)
     os.close(slave_fd)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     async def pty_to_ws():
         try:
@@ -246,20 +246,27 @@ document.getElementById('td').addEventListener('toggle',function(e){{
   if(e.target.open&&!termInited){{termInited=true;initTerm();}}
 }});
 function initTerm(){{
-  var term=new Terminal({{cursorBlink:true,fontSize:13,fontFamily:'monospace',theme:{{background:'#000'}}}});
-  var fit=new FitAddon.FitAddon();
-  term.loadAddon(fit);
-  term.open(document.getElementById('termbox'));
-  fit.fit();
-  var proto=location.protocol==='https:'?'wss:':'ws:';
-  var ws=new WebSocket(proto+'//'+location.host+'/terminal/ws');
-  ws.binaryType='arraybuffer';
-  ws.onopen=function(){{ws.send(JSON.stringify({{type:'resize',cols:term.cols,rows:term.rows}}));}};
-  ws.onmessage=function(e){{term.write(new Uint8Array(e.data));}};
-  ws.onclose=function(){{term.write('\r\n\x1b[31m[disconnected]\x1b[0m\r\n');}};
-  term.onData(function(d){{if(ws.readyState===1)ws.send(new TextEncoder().encode(d));}});
-  term.onResize(function(s){{if(ws.readyState===1)ws.send(JSON.stringify({{type:'resize',cols:s.cols,rows:s.rows}}));}});
-  window.addEventListener('resize',function(){{fit.fit();}});
+  var div=document.getElementById('termbox');
+  try{{
+    var term=new Terminal({{cursorBlink:true,fontSize:13,fontFamily:'monospace',theme:{{background:'#000'}}}});
+    var fit=null;
+    if(typeof FitAddon!=='undefined'){{fit=new FitAddon.FitAddon();term.loadAddon(fit);}}
+    term.open(div);
+    term.write('Connecting...\\r\\n');
+    if(fit)fit.fit();
+    var proto=location.protocol==='https:'?'wss:':'ws:';
+    var ws=new WebSocket(proto+'//'+location.host+'/terminal/ws');
+    ws.binaryType='arraybuffer';
+    ws.onopen=function(){{ws.send(JSON.stringify({{type:'resize',cols:term.cols,rows:term.rows}}));}};
+    ws.onmessage=function(e){{term.write(new Uint8Array(e.data));}};
+    ws.onerror=function(){{term.write('\\r\\n[WebSocket error — is the server running?]\\r\\n');}};
+    ws.onclose=function(){{term.write('\\r\\n\\x1b[31m[disconnected — reload page to reconnect]\\x1b[0m\\r\\n');}};
+    term.onData(function(d){{if(ws.readyState===1)ws.send(new TextEncoder().encode(d));}});
+    if(fit){{
+      term.onResize(function(s){{if(ws.readyState===1)ws.send(JSON.stringify({{type:'resize',cols:s.cols,rows:s.rows}}));}});
+      window.addEventListener('resize',function(){{fit.fit();}});
+    }}
+  }}catch(err){{div.innerHTML='<pre style="color:#f00;padding:8px">Terminal init error: '+err+'</pre>';}}
 }}
 </script></body></html>'''
         self.ok(html.encode(),'text/html')
