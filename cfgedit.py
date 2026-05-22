@@ -1,5 +1,6 @@
 from http.server import HTTPServer,BaseHTTPRequestHandler
 import urllib.parse,urllib.request,os,json,http.client,subprocess,sys,threading
+import asyncio,struct,fcntl,termios,pty
 CONFIG='/app/config.yaml'
 STATUS='/tmp/serve_status.json'
 DOWNLOADER_FILE='/app/downloader'
@@ -70,6 +71,51 @@ def get_status():
                 if r.status==200: base['status']='ready'; base['ts']=int(__import__('time').time())
             except: pass
     return base
+
+async def _terminal_ws_handler(websocket):
+    master_fd, slave_fd = pty.openpty()
+    env = {**os.environ, 'TERM': 'xterm-256color'}
+    proc = subprocess.Popen(['bash','--login'],
+                            stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                            close_fds=True, env=env)
+    os.close(slave_fd)
+    loop = asyncio.get_event_loop()
+
+    async def pty_to_ws():
+        try:
+            while True:
+                data = await loop.run_in_executor(None, os.read, master_fd, 4096)
+                if not data: break
+                await websocket.send(data)
+        except Exception: pass
+
+    async def ws_to_pty():
+        try:
+            async for msg in websocket:
+                if isinstance(msg, str):
+                    try:
+                        d = json.loads(msg)
+                        if d.get('type') == 'resize':
+                            fcntl.ioctl(master_fd, termios.TIOCSWINSZ,
+                                        struct.pack('HHHH', int(d['rows']), int(d['cols']), 0, 0))
+                    except Exception: pass
+                else:
+                    os.write(master_fd, msg)
+        except Exception: pass
+
+    try:
+        await asyncio.gather(pty_to_ws(), ws_to_pty())
+    finally:
+        proc.kill(); proc.wait()
+        try: os.close(master_fd)
+        except: pass
+
+def _start_terminal_server():
+    async def _serve():
+        import websockets as _ws
+        async with _ws.serve(_terminal_ws_handler, '0.0.0.0', 5006):
+            await asyncio.Future()
+    asyncio.run(_serve())
 
 class H(BaseHTTPRequestHandler):
     def log_message(self,fmt,*a): print(f'[cfgedit] {self.address_string()} {fmt%a}',flush=True)
@@ -187,6 +233,34 @@ function poll(){{
   }}).catch(()=>{{}})
 }}
 poll();setInterval(poll,2000);
+</script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+<details id=td><summary style="cursor:pointer;user-select:none;margin-top:4px">&#9658; Terminal</summary>
+<div id=termbox style="height:320px;background:#000;padding:2px;margin:4px 0;border-radius:3px"></div>
+</details>
+<script>
+var termInited=false;
+document.getElementById('td').addEventListener('toggle',function(e){{
+  if(e.target.open&&!termInited){{termInited=true;initTerm();}}
+}});
+function initTerm(){{
+  var term=new Terminal({{cursorBlink:true,fontSize:13,fontFamily:'monospace',theme:{{background:'#000'}}}});
+  var fit=new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById('termbox'));
+  fit.fit();
+  var proto=location.protocol==='https:'?'wss:':'ws:';
+  var ws=new WebSocket(proto+'//'+location.host+'/terminal/ws');
+  ws.binaryType='arraybuffer';
+  ws.onopen=function(){{ws.send(JSON.stringify({{type:'resize',cols:term.cols,rows:term.rows}}));}};
+  ws.onmessage=function(e){{term.write(new Uint8Array(e.data));}};
+  ws.onclose=function(){{term.write('\r\n\x1b[31m[disconnected]\x1b[0m\r\n');}};
+  term.onData(function(d){{if(ws.readyState===1)ws.send(new TextEncoder().encode(d));}});
+  term.onResize(function(s){{if(ws.readyState===1)ws.send(JSON.stringify({{type:'resize',cols:s.cols,rows:s.rows}}));}});
+  window.addEventListener('resize',function(){{fit.fit();}});
+}}
 </script></body></html>'''
         self.ok(html.encode(),'text/html')
 
@@ -222,4 +296,5 @@ setInterval(loadLog,2000);setInterval(loadPS,10000);
         self.ok(html.encode(),'text/html')
 
 print('[cfgedit] starting on 0.0.0.0:5005',flush=True)
+threading.Thread(target=_start_terminal_server,daemon=True).start()
 HTTPServer(('0.0.0.0',5005),H).serve_forever()

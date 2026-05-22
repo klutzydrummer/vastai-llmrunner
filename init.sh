@@ -37,6 +37,8 @@ wait_port(){
 
 # ── pip deps ──────────────────────────────────────────────────────────────────
 install_pip_deps(){
+    LOG "installing websockets"
+    pip install -q websockets --break-system-packages
     if [ "${DOWNLOADER:-aria2c}" = "hf" ]; then
         LOG "installing huggingface_hub"
         pip install -q huggingface_hub --break-system-packages
@@ -163,6 +165,9 @@ start_services(){
     LOG "writing Caddyfile"
     cat > /tmp/Caddyfile << 'CADDY'
 :5000 {
+  handle /terminal* {
+    reverse_proxy localhost:5006
+  }
   handle /editor* {
     uri strip_prefix /editor
     reverse_proxy localhost:5005
