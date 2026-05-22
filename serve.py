@@ -353,6 +353,11 @@ if draft_n>0:
     print(f'[serve] MTP: arch={arch} mtp_depth={mtp_depth} draft_n={draft_n}',flush=True)
     args+=['--spec-type','draft-mtp','--spec-draft-n-max',str(draft_n)]
 binary=find_binary()
+# Include the binary's directory in LD_LIBRARY_PATH so co-located shared
+# libraries (e.g. libllama-common.so.0, libggml*.so) are found by the linker.
+_bd=os.path.dirname(os.path.abspath(binary))
+_ld=os.environ.get('LD_LIBRARY_PATH','')
+os.environ['LD_LIBRARY_PATH']=':'.join(x for x in [_bd,_ld] if x)
 print(f'[serve] exec {binary} {args}',flush=True)
 for _p in [mp]+([mmp] if mmp and os.path.isfile(mmp) else [])+([dmp] if dmp and os.path.isfile(dmp) else []):
     try: open(_p+'.pid','w').write(str(os.getpid()))

@@ -122,6 +122,30 @@ download_bin(){
     LOG "$name installed OK"
 }
 
+# ── llama shared-library setup ────────────────────────────────────────────────
+# Newer llama.cpp builds link against libllama-common.so.0 and libggml*.so as
+# separate shared libraries.  If those .so files live beside the binary in /app
+# but /app isn't in ldconfig's search path the dynamic linker won't find them.
+# Register /app unconditionally (harmless when empty) and warn if anything is
+# still unresolved so the error is obvious rather than cryptic.
+setup_llama_libs(){
+    echo '/app' > /etc/ld.so.conf.d/llama.conf
+    ldconfig
+    LOG "ldconfig: registered /app"
+
+    local binary=/app/llama-server
+    [ -f "$binary" ] || return 0
+
+    local missing
+    missing=$(ldd "$binary" 2>/dev/null | awk '/not found/{print $1}' | tr '\n' ' ') || true
+    if [ -n "$missing" ]; then
+        ERR "llama-server is still missing shared libraries after ldconfig: ${missing}"
+        ERR "Ensure the container image ships the matching .so files in /app alongside the binary."
+    else
+        LOG "llama-server: all shared library dependencies satisfied"
+    fi
+}
+
 # ── config generation ─────────────────────────────────────────────────────────
 gen_config(){
     LOG "generating /app/config.yaml"
@@ -269,6 +293,7 @@ main(){
     mkdir -p /app /models
 
     install_pip_deps
+    setup_llama_libs
 
     # llama-swap: tag=v211 → ver=211 → llama-swap_211_linux_amd64.tar.gz
     download_bin llama-swap \
