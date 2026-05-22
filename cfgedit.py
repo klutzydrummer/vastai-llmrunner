@@ -237,18 +237,31 @@ poll();setInterval(poll,2000);
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
 <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
-<details id=td><summary style="cursor:pointer;user-select:none;margin-top:4px">&#9658; Terminal</summary>
+<details id=td><summary style="cursor:pointer;user-select:none;margin-top:4px">&#9658; Terminal
+<button id=tcopy onclick="event.preventDefault();copyTerm()" style="margin-left:8px;padding:2px 8px;font-family:monospace;font-size:11px">Copy</button></summary>
 <div id=termbox style="height:320px;background:#000;padding:2px;margin:4px 0;border-radius:3px"></div>
 </details>
 <script>
-var termInited=false;
+var termInited=false,term=null;
 document.getElementById('td').addEventListener('toggle',function(e){{
   if(e.target.open&&!termInited){{termInited=true;initTerm();}}
 }});
+function copyTerm(){{
+  if(!term)return;
+  var buf=term.buffer.active,lines=[],i;
+  for(i=0;i<buf.length;i++){{var l=buf.getLine(i);if(l)lines.push(l.translateToString(true));}}
+  while(lines.length&&!lines[lines.length-1].trim())lines.pop();
+  var b=document.getElementById('tcopy');
+  navigator.clipboard.writeText(lines.join('\\n')).then(function(){{
+    b.textContent='Copied!';setTimeout(function(){{b.textContent='Copy';}},2000);
+  }}).catch(function(){{
+    b.textContent='Failed';setTimeout(function(){{b.textContent='Copy';}},2000);
+  }});
+}}
 function initTerm(){{
   var div=document.getElementById('termbox');
   try{{
-    var term=new Terminal({{cursorBlink:true,fontSize:13,fontFamily:'monospace',theme:{{background:'#000'}},copyOnSelect:true}});
+    term=new Terminal({{cursorBlink:true,fontSize:13,fontFamily:'monospace',theme:{{background:'#000'}},copyOnSelect:true}});
     var fit=null;
     if(typeof FitAddon!=='undefined'){{fit=new FitAddon.FitAddon();term.loadAddon(fit);}}
     term.open(div);
