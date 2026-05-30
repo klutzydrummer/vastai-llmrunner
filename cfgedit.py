@@ -44,6 +44,8 @@ def llama_swap(method,path,body=None):
 def unload_all():
     s,_=llama_swap('POST','/api/models/unload')
     print(f'[cfgedit] unload: {s}',flush=True)
+    try: os.remove(STATUS)
+    except: pass
 
 def get_running():
     s,d=llama_swap('GET','/running')
