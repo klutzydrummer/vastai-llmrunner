@@ -1,5 +1,5 @@
 from http.server import HTTPServer,BaseHTTPRequestHandler
-import urllib.parse,urllib.request,os,json,http.client,subprocess,sys,threading
+import urllib.parse,urllib.request,os,json,http.client,subprocess,sys,threading,time
 import asyncio,struct,fcntl,termios,pty
 CONFIG='/app/config.yaml'
 STATUS='/tmp/serve_status.json'
@@ -44,6 +44,20 @@ def llama_swap(method,path,body=None):
 def unload_all():
     s,_=llama_swap('POST','/api/models/unload')
     print(f'[cfgedit] unload: {s}',flush=True)
+    try: os.remove(STATUS)
+    except: pass
+
+def _preload(model):
+    time.sleep(1)
+    print(f'[cfgedit] preloading {model}',flush=True)
+    try:
+        body=json.dumps({'model':model,'messages':[{'role':'user','content':'hi'}],'max_tokens':1}).encode()
+        c=http.client.HTTPConnection(LLAMA_SWAP_HOST,LLAMA_SWAP_PORT,timeout=3600)
+        c.request('POST','/v1/chat/completions',body=body,headers={'Content-Type':'application/json'})
+        r=c.getresponse(); r.read(); c.close()
+        print(f'[cfgedit] preload {model}: {r.status}',flush=True)
+    except Exception as e:
+        print(f'[cfgedit] preload error: {e}',flush=True)
 
 def get_running():
     s,d=llama_swap('GET','/running')
@@ -166,6 +180,14 @@ class H(BaseHTTPRequestHandler):
             if v: open(DEFAULT_MODEL_FILE,'w').write(v)
             elif os.path.exists(DEFAULT_MODEL_FILE): os.remove(DEFAULT_MODEL_FILE)
             print(f'[cfgedit] default_model: {v or "cleared"}',flush=True);self.ok(b'OK\n')
+        elif self.path=='/load':
+            v=body.decode().strip()
+            if v:
+                unload_all()
+                open(DEFAULT_MODEL_FILE,'w').write(v)
+                threading.Thread(target=_preload,args=(v,),daemon=True).start()
+                print(f'[cfgedit] load: {v}',flush=True);self.ok(b'OK\n')
+            else: self.send_response(400);self.end_headers()
         elif self.path=='/update':
             self.ok(b'OK\n')
             threading.Thread(target=update_scripts,daemon=True).start()
@@ -183,6 +205,7 @@ class H(BaseHTTPRequestHandler):
 <div id=st>...</div>
 <div>
 <label>Default model: <select id=dm onchange="setDM(this.value)">{dm_opts}</select></label>
+<button onclick="doLoad()">Switch</button>
 <label>Downloader: <select id=dl onchange="setDL(this.value)">
 <option value="" {"selected" if not cur else ""}>env default</option>
 <option value="aria2c" {"selected" if cur=="aria2c" else ""}>aria2c</option>
@@ -205,6 +228,7 @@ class H(BaseHTTPRequestHandler):
 <script>
 var M=document.getElementById('msg'),E='/editor',lastSaveTs=0,slPaused=false;
 function setDM(v){{fetch(E+'/default_model',{{method:'POST',body:v}}).then(()=>M.textContent='✓ default model set')}}
+function doLoad(){{var v=document.getElementById('dm').value;if(!v){{M.textContent='select a model first';return;}}M.textContent='switching...';fetch(E+'/load',{{method:'POST',body:v}}).then(r=>M.textContent=r.ok?'✓ loading '+v:'✗ '+r.status)}}
 function setDL(v){{fetch(E+'/downloader',{{method:'POST',body:v}}).then(()=>M.textContent='✓ downloader set')}}
 function doUnload(){{fetch(E+'/unload',{{method:'POST'}}).then(()=>M.textContent='✓ unloaded')}}
 function doUpdate(){{M.textContent='updating...';fetch(E+'/update',{{method:'POST'}}).then(()=>{{M.textContent='restarting...';setTimeout(()=>location.href=location.pathname+'?r='+Date.now(),5000)}}).catch(()=>{{M.textContent='restarting...';setTimeout(()=>location.href=location.pathname+'?r='+Date.now(),5000)}})}}
