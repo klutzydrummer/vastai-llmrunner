@@ -347,6 +347,9 @@ if mtp_env:
     draft_n=int(mtp_env)
 elif mtp_depth>0:
     draft_n=mtp_depth
+elif dmp and os.path.isfile(dmp):
+    dmeta,darch=pg(dmp)
+    draft_n=int(dmeta.get(f'{darch}.mtp_depth',0) or 0)
 else:
     draft_n=0
 if draft_n>0:
