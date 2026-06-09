@@ -164,13 +164,11 @@ def dl(url,keep):
                     os.environ['HF_HUB_ENABLE_HF_TRANSFER']='1'
                 else:
                     os.environ['HF_XET_HIGH_PERFORMANCE']='1'
-                cmd=['huggingface-cli','download',repo,fname,'--revision',rev,'--local-dir',MODEL_DIR]
-                if HF_TOKEN: cmd+=['--token',HF_TOKEN]
-                run_streaming(cmd)
-                # hf may preserve subdir structure (e.g. MTP/file.gguf) or flatten to MODEL_DIR/file.gguf
-                hf_src=f'{MODEL_DIR}/{fname}' if os.path.isfile(f'{MODEL_DIR}/{fname}') else f'{MODEL_DIR}/{name}'
-                if hf_src!=dest and os.path.isfile(hf_src) and not os.path.isfile(dest):
-                    os.rename(hf_src,dest)
+                print(f'[serve] hf_hub_download {repo} {fname}',flush=True)
+                from huggingface_hub import hf_hub_download as _hfdl
+                out=_hfdl(repo_id=repo,filename=fname,revision=rev,local_dir=MODEL_DIR,token=HF_TOKEN or None)
+                if out and out!=dest and os.path.isfile(out) and not os.path.isfile(dest):
+                    os.rename(out,dest)
             else:
                 cmd=['aria2c','-x16','-s16','-k10M','--file-allocation=none',
                      '--summary-interval=30','--show-console-readout=false',
@@ -206,12 +204,11 @@ def dl(url,keep):
                     rem=url.removeprefix('https://huggingface.co/')
                     hf_parts=rem.split('/'); hf_repo='/'.join(hf_parts[:2]); hf_rev=hf_parts[3]; hf_fname='/'.join(hf_parts[4:])
                     os.environ['HF_XET_HIGH_PERFORMANCE']='1'
-                    hf_cmd=['huggingface-cli','download',hf_repo,hf_fname,'--revision',hf_rev,'--local-dir',MODEL_DIR]
-                    if HF_TOKEN: hf_cmd+=['--token',HF_TOKEN]
-                    run_streaming(hf_cmd)
-                    hf_src=f'{MODEL_DIR}/{hf_fname}' if os.path.isfile(f'{MODEL_DIR}/{hf_fname}') else f'{MODEL_DIR}/{name}'
-                    if hf_src!=dest and os.path.isfile(hf_src) and not os.path.isfile(dest):
-                        os.rename(hf_src,dest)
+                    print(f'[serve] hf_hub_download fallback {hf_repo} {hf_fname}',flush=True)
+                    from huggingface_hub import hf_hub_download as _hfdl
+                    out=_hfdl(repo_id=hf_repo,filename=hf_fname,revision=hf_rev,local_dir=MODEL_DIR,token=HF_TOKEN or None)
+                    if out and out!=dest and os.path.isfile(out) and not os.path.isfile(dest):
+                        os.rename(out,dest)
                     last_exc=None; break
                 except Exception as hf_e:
                     print(f'[serve] hf fallback also failed: {hf_e}',flush=True)
