@@ -200,9 +200,9 @@ class H(BaseHTTPRequestHandler):
         dm_opts=f'<option value="" {"selected" if not cur_dm else ""}>env default</option>'
         dm_opts+=''.join(f'<option value="{m}" {"selected" if cur_dm==m else ""}>{m}</option>' for m in model_ids)
         html=f'''<!DOCTYPE html><html><head><meta charset=utf-8><title>llama-swap</title>
-<style>body{{font-family:monospace;margin:1em}}textarea{{width:100%;height:60vh;font-family:monospace;font-size:12px}}select,button{{margin:2px;padding:4px 10px;font-family:monospace}}#st{{padding:6px;background:#eee;margin-bottom:6px;font-size:13px}}small{{color:#888}}</style></head>
+<style>body{{font-family:monospace;margin:1em}}textarea{{width:100%;height:60vh;font-family:monospace;font-size:12px}}select,button{{margin:2px;padding:4px 10px;font-family:monospace}}#st{{padding:6px;background:#eee;font-size:13px}}.strow{{margin-bottom:6px}}small{{color:#888}}</style></head>
 <body><h3>llama-swap config.yaml</h3>
-<div id=st>...</div>
+<div class=strow style="display:flex;align-items:flex-start;gap:4px"><div id=st style="flex:1">...</div><button onclick="navigator.clipboard.writeText(document.getElementById('st').textContent)" style="padding:2px 7px;font-size:11px;font-family:monospace;flex-shrink:0">copy</button></div>
 <div>
 <label>Default model: <select id=dm onchange="setDM(this.value)">{dm_opts}</select></label>
 <button onclick="doLoad()">Switch</button>
