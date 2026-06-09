@@ -164,7 +164,7 @@ def dl(url,keep):
                     os.environ['HF_HUB_ENABLE_HF_TRANSFER']='1'
                 else:
                     os.environ['HF_XET_HIGH_PERFORMANCE']='1'
-                cmd=['hf','download',repo,fname,'--revision',rev,'--local-dir',MODEL_DIR]
+                cmd=['huggingface-cli','download',repo,fname,'--revision',rev,'--local-dir',MODEL_DIR]
                 if HF_TOKEN: cmd+=['--token',HF_TOKEN]
                 run_streaming(cmd)
                 # hf may preserve subdir structure (e.g. MTP/file.gguf) or flatten to MODEL_DIR/file.gguf
@@ -206,7 +206,7 @@ def dl(url,keep):
                     rem=url.removeprefix('https://huggingface.co/')
                     hf_parts=rem.split('/'); hf_repo='/'.join(hf_parts[:2]); hf_rev=hf_parts[3]; hf_fname='/'.join(hf_parts[4:])
                     os.environ['HF_XET_HIGH_PERFORMANCE']='1'
-                    hf_cmd=['hf','download',hf_repo,hf_fname,'--revision',hf_rev,'--local-dir',MODEL_DIR]
+                    hf_cmd=['huggingface-cli','download',hf_repo,hf_fname,'--revision',hf_rev,'--local-dir',MODEL_DIR]
                     if HF_TOKEN: hf_cmd+=['--token',HF_TOKEN]
                     run_streaming(hf_cmd)
                     hf_src=f'{MODEL_DIR}/{hf_fname}' if os.path.isfile(f'{MODEL_DIR}/{hf_fname}') else f'{MODEL_DIR}/{name}'
