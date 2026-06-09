@@ -167,10 +167,10 @@ def dl(url,keep):
                 cmd=['hf','download',repo,fname,'--revision',rev,'--local-dir',MODEL_DIR]
                 if HF_TOKEN: cmd+=['--token',HF_TOKEN]
                 run_streaming(cmd)
-                # hf downloads to raw filename; rename to hash-prefixed dest
-                raw_dest=f'{MODEL_DIR}/{name}'
-                if raw_dest!=dest and os.path.isfile(raw_dest) and not os.path.isfile(dest):
-                    os.rename(raw_dest,dest)
+                # hf may preserve subdir structure (e.g. MTP/file.gguf) or flatten to MODEL_DIR/file.gguf
+                hf_src=f'{MODEL_DIR}/{fname}' if os.path.isfile(f'{MODEL_DIR}/{fname}') else f'{MODEL_DIR}/{name}'
+                if hf_src!=dest and os.path.isfile(hf_src) and not os.path.isfile(dest):
+                    os.rename(hf_src,dest)
             else:
                 cmd=['aria2c','-x16','-s16','-k10M','--file-allocation=none',
                      '--summary-interval=30','--show-console-readout=false',
@@ -196,8 +196,26 @@ def dl(url,keep):
 
         except sp.CalledProcessError as e:
             last_exc=e; rc=e.returncode
-            if DOWNLOADER=='hf' or rc in _FATAL_ARIA2C_CODES or attempt>=DOWNLOAD_MAX_ATTEMPTS:
+            if DOWNLOADER=='hf' or attempt>=DOWNLOAD_MAX_ATTEMPTS:
                 _try_remove(dest,f'{dest}.aria2'); break
+            if rc in _FATAL_ARIA2C_CODES:
+                # aria2c can't reach the file (404/auth/etc) — try hf CLI as fallback
+                print(f'[serve] aria2c fatal rc={rc} for {name}, trying hf fallback',flush=True)
+                _try_remove(dest,f'{dest}.aria2')
+                try:
+                    rem=url.removeprefix('https://huggingface.co/')
+                    hf_parts=rem.split('/'); hf_repo='/'.join(hf_parts[:2]); hf_rev=hf_parts[3]; hf_fname='/'.join(hf_parts[4:])
+                    os.environ['HF_XET_HIGH_PERFORMANCE']='1'
+                    hf_cmd=['hf','download',hf_repo,hf_fname,'--revision',hf_rev,'--local-dir',MODEL_DIR]
+                    if HF_TOKEN: hf_cmd+=['--token',HF_TOKEN]
+                    run_streaming(hf_cmd)
+                    hf_src=f'{MODEL_DIR}/{hf_fname}' if os.path.isfile(f'{MODEL_DIR}/{hf_fname}') else f'{MODEL_DIR}/{name}'
+                    if hf_src!=dest and os.path.isfile(hf_src) and not os.path.isfile(dest):
+                        os.rename(hf_src,dest)
+                    last_exc=None; break
+                except Exception as hf_e:
+                    print(f'[serve] hf fallback also failed: {hf_e}',flush=True)
+                    last_exc=hf_e; break
             print(f'[serve] error attempt {attempt} (rc={rc}): retrying in {delay}s',flush=True)
             write_status({'status':'retrying','model':name,'attempt':attempt,
                           'max_attempts':DOWNLOAD_MAX_ATTEMPTS,'reason':f'exit {rc}',
