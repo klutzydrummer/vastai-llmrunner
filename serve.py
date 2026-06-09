@@ -165,7 +165,10 @@ def dl(url,keep):
                 else:
                     os.environ['HF_XET_HIGH_PERFORMANCE']='1'
                 print(f'[serve] hf_hub_download {repo} {fname}',flush=True)
-                from huggingface_hub import hf_hub_download as _hfdl
+                try: from huggingface_hub import hf_hub_download as _hfdl
+                except ImportError:
+                    sp.run(['pip','install','-q','huggingface_hub','--break-system-packages'],check=True)
+                    from huggingface_hub import hf_hub_download as _hfdl
                 out=_hfdl(repo_id=repo,filename=fname,revision=rev,local_dir=MODEL_DIR,token=HF_TOKEN or None)
                 if out and out!=dest and os.path.isfile(out) and not os.path.isfile(dest):
                     os.rename(out,dest)
@@ -205,7 +208,10 @@ def dl(url,keep):
                     hf_parts=rem.split('/'); hf_repo='/'.join(hf_parts[:2]); hf_rev=hf_parts[3]; hf_fname='/'.join(hf_parts[4:])
                     os.environ['HF_XET_HIGH_PERFORMANCE']='1'
                     print(f'[serve] hf_hub_download fallback {hf_repo} {hf_fname}',flush=True)
-                    from huggingface_hub import hf_hub_download as _hfdl
+                    try: from huggingface_hub import hf_hub_download as _hfdl
+                    except ImportError:
+                        sp.run(['pip','install','-q','huggingface_hub','--break-system-packages'],check=True)
+                        from huggingface_hub import hf_hub_download as _hfdl
                     out=_hfdl(repo_id=hf_repo,filename=hf_fname,revision=hf_rev,local_dir=MODEL_DIR,token=HF_TOKEN or None)
                     if out and out!=dest and os.path.isfile(out) and not os.path.isfile(dest):
                         os.rename(out,dest)
