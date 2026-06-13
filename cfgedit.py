@@ -226,13 +226,12 @@ class H(BaseHTTPRequestHandler):
 <pre id=slog style="background:#111;color:#0f0;padding:6px;height:25vh;overflow-y:auto;font-size:11px;white-space:pre-wrap;word-break:break-all;margin:2px 0">(no model running)</pre>
 </details>
 <script>
-if(location.search)history.replaceState(null,'',location.pathname);
 var M=document.getElementById('msg'),E='/editor',lastSaveTs=0,slPaused=false;
 function setDM(v){{fetch(E+'/default_model',{{method:'POST',body:v}}).then(()=>M.textContent='✓ default model set')}}
 function doLoad(){{var v=document.getElementById('dm').value;if(!v){{M.textContent='select a model first';return;}}M.textContent='switching...';fetch(E+'/load',{{method:'POST',body:v}}).then(r=>M.textContent=r.ok?'✓ loading '+v:'✗ '+r.status)}}
 function setDL(v){{fetch(E+'/downloader',{{method:'POST',body:v}}).then(()=>M.textContent='✓ downloader set')}}
 function doUnload(){{fetch(E+'/unload',{{method:'POST'}}).then(()=>M.textContent='✓ unloaded')}}
-function doUpdate(){{M.textContent='updating...';fetch(E+'/update',{{method:'POST'}}).then(()=>{{M.textContent='restarting...';setTimeout(()=>location.href=location.pathname+'?r='+Date.now(),5000)}}).catch(()=>{{M.textContent='restarting...';setTimeout(()=>location.href=location.pathname+'?r='+Date.now(),5000)}})}}
+function doUpdate(){{M.textContent='updating...';fetch(E+'/update',{{method:'POST'}}).then(()=>{{M.textContent='restarting...';var t=Date.now();(function wait(){{fetch(E+'/status',{{cache:'no-store'}}).then(()=>location.href=location.pathname).catch(()=>{{if(Date.now()-t<30000)setTimeout(wait,800);else location.href=location.pathname;}});}})();}}).catch(()=>{{M.textContent='restarting...';setTimeout(()=>location.href=location.pathname,6000);}})}}
 function doSave(){{M.textContent='saving...';lastSaveTs=Date.now()/1000;fetch(E+'/config',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:'cfg='+encodeURIComponent(document.getElementById('cfg').value)}}).then(r=>M.textContent=r.ok?'✓ saved':'✗ '+r.status)}}
 function age(ts){{if(!ts)return'';var d=Math.floor(Date.now()/1000-ts);if(d<5)return' (just now)';if(d<60)return' ('+d+'s ago)';if(d<3600)return' ('+Math.floor(d/60)+'m ago)';return' ('+Math.floor(d/3600)+'h ago)';}}
 function poll(){{
