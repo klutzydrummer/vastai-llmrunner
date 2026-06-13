@@ -226,6 +226,7 @@ class H(BaseHTTPRequestHandler):
 <pre id=slog style="background:#111;color:#0f0;padding:6px;height:25vh;overflow-y:auto;font-size:11px;white-space:pre-wrap;word-break:break-all;margin:2px 0">(no model running)</pre>
 </details>
 <script>
+if(location.search)history.replaceState(null,'',location.pathname);
 var M=document.getElementById('msg'),E='/editor',lastSaveTs=0,slPaused=false;
 function setDM(v){{fetch(E+'/default_model',{{method:'POST',body:v}}).then(()=>M.textContent='✓ default model set')}}
 function doLoad(){{var v=document.getElementById('dm').value;if(!v){{M.textContent='select a model first';return;}}M.textContent='switching...';fetch(E+'/load',{{method:'POST',body:v}}).then(r=>M.textContent=r.ok?'✓ loading '+v:'✗ '+r.status)}}
