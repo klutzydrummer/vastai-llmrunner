@@ -375,6 +375,10 @@ elif dmp and os.path.isfile(dmp):
         d_nl=int(dmeta.get(f'{darch}.block_count',0) or 0)
         draft_n=d_nl if 0<d_nl<=8 else 3
         print(f'[serve] MTP: inferred draft_n={draft_n} from draft model arch={darch!r}',flush=True)
+    if draft_n==0 and 'mtp' in os.path.basename(dmp).lower():
+        d_nl=int(dmeta.get(f'{darch}.block_count',0) or 0)
+        draft_n=d_nl if 0<d_nl<=8 else 3
+        print(f'[serve] MTP: inferred draft_n={draft_n} from draft model filename',flush=True)
 else:
     draft_n=0
 if draft_n>0:
