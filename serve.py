@@ -371,6 +371,10 @@ elif mtp_depth>0:
 elif dmp and os.path.isfile(dmp):
     dmeta,darch=pg(dmp)
     draft_n=int(dmeta.get(f'{darch}.mtp_depth',0) or 0)
+    # MTP draft models may not embed mtp_depth in metadata; detect by filename
+    if draft_n==0 and 'mtp' in os.path.basename(dmp).lower():
+        draft_n=3
+        print(f'[serve] MTP: inferred draft_n=3 from draft model filename',flush=True)
 else:
     draft_n=0
 if draft_n>0:
