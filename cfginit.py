@@ -14,17 +14,24 @@ for sfx in suffixes:
     DMU = os.environ.get(f"DRAFT_MODEL_URL{sfx}", "")
     MN = MU.split("/")[-1].replace(".gguf", "")
     found += 1
-    for text_only in ([False, True] if MMU else [False]):
+    # variants: (suffix, include_mmproj, include_draft, no_mtp)
+    variants = [('', True, True, False)]        # default: mmproj + draft
+    if MMU:
+        variants.append(('-nomtp', True, False, True))   # mmproj, no draft, spec disabled
+        variants.append(('-text', False, True, False))   # no mmproj, draft only
+    for sfxv, use_mm, use_dm, no_mtp in variants:
         for par in [1, 2, 4, 8]:
-            mid = f"{MN}-p{par}{'-text' if text_only else ''}"
+            mid = f"{MN}-p{par}{sfxv}"
             lines.append(f"  {mid!r}:")
             lines.append(f'    proxy: "http://127.0.0.1:${{PORT}}"')
             lines.append(f"    env:")
             lines.append(f'      - "MODEL_URL={MU}"')
-            if MMU and not text_only:
+            if MMU and use_mm:
                 lines.append(f'      - "MMPROJ_URL={MMU}"')
-            if DMU:
+            if DMU and use_dm:
                 lines.append(f'      - "DRAFT_MODEL_URL={DMU}"')
+            if no_mtp:
+                lines.append(f'      - "NO_MTP=1"')
             for k in PASS_KEYS:
                 v = os.environ.get(k)
                 if v:

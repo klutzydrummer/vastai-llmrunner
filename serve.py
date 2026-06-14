@@ -381,7 +381,10 @@ elif dmp and os.path.isfile(dmp):
         print(f'[serve] MTP: inferred draft_n={draft_n} from draft model filename',flush=True)
 else:
     draft_n=0
-if draft_n>0:
+if os.environ.get('NO_MTP','0')=='1':
+    args+=['--spec-type','none']
+    print('[serve] NO_MTP=1: speculative decoding disabled',flush=True)
+elif draft_n>0:
     print(f'[serve] MTP: arch={arch} mtp_depth={mtp_depth} draft_n={draft_n}',flush=True)
     args+=['--spec-type','draft-mtp','--spec-draft-n-max',str(draft_n)]
 binary=find_binary()
