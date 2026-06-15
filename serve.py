@@ -244,7 +244,7 @@ mmp=''
 if MMPROJ_URL and MMPROJ_URL not in ('','null'):
     mmp=dl(MMPROJ_URL,keep)
 dmp=''
-if DRAFT_MODEL_URL and DRAFT_MODEL_URL not in ('','null'):
+if DRAFT_MODEL_URL and DRAFT_MODEL_URL not in ('','null') and os.environ.get('NO_MTP','0')!='1':
     dmp=dl(DRAFT_MODEL_URL,keep)
 
 def _detect_vrams(retries=5,delay=3):
