@@ -191,6 +191,19 @@ class H(BaseHTTPRequestHandler):
         elif self.path=='/update':
             self.ok(b'OK\n')
             threading.Thread(target=update_scripts,daemon=True).start()
+        elif self.path=='/regen':
+            try:
+                import subprocess as _sp
+                r=_sp.run(['python3','/tmp/cfginit.py'],capture_output=True,text=True,timeout=30)
+                if r.returncode==0:
+                    cfg=open(CONFIG,'r').read()
+                    unload_all()
+                    self.ok(cfg.encode(),'text/yaml')
+                else:
+                    self.ok((r.stderr or r.stdout or 'cfginit failed').encode(),)
+                    print(f'[cfgedit] regen failed: {r.stderr}',flush=True)
+            except Exception as e:
+                self.ok(str(e).encode()); print(f'[cfgedit] regen error: {e}',flush=True)
         else: self.send_response(404);self.end_headers()
     def _ui(self):
         d=open(CONFIG,'r').read().replace('&','&amp;').replace('<','&lt;')
@@ -213,6 +226,7 @@ class H(BaseHTTPRequestHandler):
 </select></label>
 <button onclick="doUnload()">Unload</button>
 <button onclick="doSave()">Save &amp; Reload</button>
+<button onclick="doRegen()">Regen Config</button>
 <button onclick="doUpdate()">Update Scripts</button>
 <a href="/ui" target="_blank"><button type=button>llama-swap UI</button></a>
 <a href="/editor/debug" target="_blank"><button type=button>Logs / Debug</button></a>
@@ -231,6 +245,7 @@ function setDM(v){{fetch(E+'/default_model',{{method:'POST',body:v}}).then(()=>M
 function doLoad(){{var v=document.getElementById('dm').value;if(!v){{M.textContent='select a model first';return;}}M.textContent='switching...';fetch(E+'/load',{{method:'POST',body:v}}).then(r=>M.textContent=r.ok?'✓ loading '+v:'✗ '+r.status)}}
 function setDL(v){{fetch(E+'/downloader',{{method:'POST',body:v}}).then(()=>M.textContent='✓ downloader set')}}
 function doUnload(){{fetch(E+'/unload',{{method:'POST'}}).then(()=>M.textContent='✓ unloaded')}}
+function doRegen(){{M.textContent='regenerating...';fetch(E+'/regen',{{method:'POST'}}).then(r=>r.text()).then(t=>{{document.getElementById('cfg').value=t;M.textContent='✓ config regenerated — save to apply';}}).catch(e=>M.textContent='✗ '+e)}}
 function doUpdate(){{M.textContent='updating...';fetch(E+'/update',{{method:'POST'}}).then(()=>{{M.textContent='restarting...';var t=Date.now();(function wait(){{fetch(E+'/status',{{cache:'no-store'}}).then(()=>location.href=location.pathname).catch(()=>{{if(Date.now()-t<30000)setTimeout(wait,800);else location.href=location.pathname;}});}})();}}).catch(()=>{{M.textContent='restarting...';setTimeout(()=>location.href=location.pathname,6000);}})}}
 function doSave(){{M.textContent='saving...';lastSaveTs=Date.now()/1000;fetch(E+'/config',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:'cfg='+encodeURIComponent(document.getElementById('cfg').value)}}).then(r=>M.textContent=r.ok?'✓ saved':'✗ '+r.status)}}
 function age(ts){{if(!ts)return'';var d=Math.floor(Date.now()/1000-ts);if(d<5)return' (just now)';if(d<60)return' ('+d+'s ago)';if(d<3600)return' ('+Math.floor(d/60)+'m ago)';return' ('+Math.floor(d/3600)+'h ago)';}}
