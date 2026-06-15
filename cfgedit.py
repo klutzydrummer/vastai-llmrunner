@@ -1,6 +1,6 @@
 from http.server import HTTPServer,BaseHTTPRequestHandler
 import urllib.parse,urllib.request,os,json,http.client,subprocess,sys,threading,time
-import asyncio,struct,fcntl,termios,pty
+import asyncio,struct,fcntl,termios,pty,hashlib
 CONFIG='/app/config.yaml'
 STATUS='/tmp/serve_status.json'
 DOWNLOADER_FILE='/app/downloader'
@@ -10,6 +10,13 @@ SCRIPTS_BASE='https://raw.githubusercontent.com/klutzydrummer/vastai-llmrunner/m
 SCRIPTS=['serve.py','cfgedit.py','guard.py','cfginit.py','init.sh']
 LOGS={'guard':'/tmp/guard.log','llama-swap':'/tmp/llama-swap.log',
       'caddy':'/tmp/caddy.log','cfgedit':'/tmp/cfgedit.log','cloudflared':'/tmp/cloudflared.log'}
+
+def script_hash():
+    h=hashlib.sha256()
+    for f in SCRIPTS:
+        try: h.update(open(f'/tmp/{f}','rb').read())
+        except: pass
+    return h.hexdigest()[:8]
 
 def get_model_ids():
     try:
@@ -212,10 +219,12 @@ class H(BaseHTTPRequestHandler):
         model_ids=get_model_ids()
         dm_opts=f'<option value="" {"selected" if not cur_dm else ""}>env default</option>'
         dm_opts+=''.join(f'<option value="{m}" {"selected" if cur_dm==m else ""}>{m}</option>' for m in model_ids)
+        shash=script_hash()
         html=f'''<!DOCTYPE html><html><head><meta charset=utf-8><title>llama-swap</title>
 <style>body{{font-family:monospace;margin:1em}}textarea{{width:100%;height:60vh;font-family:monospace;font-size:12px}}select,button{{margin:2px;padding:4px 10px;font-family:monospace}}#st{{padding:6px;background:#eee;font-size:13px}}.strow{{margin-bottom:6px}}small{{color:#888}}</style></head>
-<body><h3>llama-swap config.yaml</h3>
+<body><h3>llama-swap config.yaml <small style="font-weight:normal">[scripts: {shash}]</small></h3>
 <div class=strow style="display:flex;align-items:flex-start;gap:4px"><div id=st style="flex:1">...</div><button onclick="navigator.clipboard.writeText(document.getElementById('st').textContent)" style="padding:2px 7px;font-size:11px;font-family:monospace;flex-shrink:0">copy</button></div>
+<details id=cd style="margin:2px 0 4px"><summary style="cursor:pointer;user-select:none;font-size:12px;color:#555">&#9658; Active server command</summary><pre id=cmdline style="background:#111;color:#aaa;padding:6px;margin:2px 0;font-size:11px;white-space:pre-wrap;word-break:break-all">(no model loaded)</pre></details>
 <div>
 <label>Default model: <select id=dm onchange="setDM(this.value)">{dm_opts}</select></label>
 <button onclick="doLoad()">Switch</button>
@@ -261,6 +270,8 @@ function poll(){{
     txt+=age(s.ts);
     el.style.background={{'error':'#fee','ready':'#dfd','downloading':'#e8f0fe','loading':'#e8f0fe','retrying':'#fff3cd'}}[st]||'#eee';
     el.textContent=txt;
+    var cp=document.getElementById('cmdline');
+    if(cp)cp.textContent=s.cmd||(st==='idle'?'(no model loaded)':'...');
     var logModel=m||(s.model||'');
     if(logModel&&!slPaused){{
       fetch(E+'/logfile?name='+encodeURIComponent('serve-'+logModel+'.log'))
