@@ -389,6 +389,9 @@ elif draft_n>0:
     args+=['--spec-type','draft-mtp','--spec-draft-n-max',str(draft_n)]
 binary=find_binary()
 print(f'[serve] exec {binary} {args}',flush=True)
+write_status({'status':'loading','model':os.path.basename(mp),'ctx':ctx,'n_ctx_train':n_ctx_train,
+              'n_ctx_per_slot':ctx//par,'vram_mb':vram_used_mb,'par':par,'port':int(PORT),
+              'ts':int(time.time()),'cmd':binary+' '+' '.join(args)})
 for _p in [mp]+([mmp] if mmp and os.path.isfile(mmp) else [])+([dmp] if dmp and os.path.isfile(dmp) else []):
     try: open(_p+'.pid','w').write(str(os.getpid()))
     except: pass
