@@ -320,6 +320,10 @@ nl=scalar(P('block_count',32));nkv=scalar(P('attention.layer_count',nl))
 nh=scalar(P('attention.head_count',32));nk=scalar(P('attention.head_count_kv',8))
 ed=scalar(P('embedding_length',4096));ffn=scalar(P('feed_forward_length',ed*4));hd=ed//nh
 ct=os.environ.get('CACHE_TYPE_K','q8_0');ctv=os.environ.get('CACHE_TYPE_V','q8_0')
+_ct_override='/app/cache_type'
+if os.path.isfile(_ct_override):
+    _v=open(_ct_override).read().strip()
+    if _v: ct=ctv=_v
 par=int(os.environ.get('PARALLEL','1'));cf=float(os.environ.get('COMPUTE_FRACTION','0.12'))
 eb={'f16':2.0,'q8_0':1.0625,'q4_0':0.5,'q4_1':0.5625,'f32':4.0,'q5_0':0.625,'q5_1':0.6875}.get(ct,2.0)
 wm=os.path.getsize(mp)/1048576*1.05
