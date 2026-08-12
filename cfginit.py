@@ -26,10 +26,12 @@ for sfx in suffixes:
             lines.append(f'    proxy: "http://127.0.0.1:${{PORT}}"')
             lines.append(f"    env:")
             lines.append(f'      - "MODEL_URL={MU}"')
-            if MMU and use_mm:
-                lines.append(f'      - "MMPROJ_URL={MMU}"')
-            if DMU and use_dm:
-                lines.append(f'      - "DRAFT_MODEL_URL={DMU}"')
+            # Always set MMPROJ_URL/DRAFT_MODEL_URL explicitly (even blank) so the
+            # spawned serve.py subprocess never falls back to inheriting the
+            # container's unsuffixed (model 1) env vars for models that don't
+            # define their own MMPROJ_URL_N / DRAFT_MODEL_URL_N.
+            lines.append(f'      - "MMPROJ_URL={MMU if use_mm else ""}"')
+            lines.append(f'      - "DRAFT_MODEL_URL={DMU if use_dm else ""}"')
             if no_mtp:
                 lines.append(f'      - "NO_MTP=1"')
             for k in PASS_KEYS:
