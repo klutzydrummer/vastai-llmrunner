@@ -1,6 +1,8 @@
 from http.server import HTTPServer,BaseHTTPRequestHandler
 import urllib.parse,urllib.request,os,json,http.client,subprocess,sys,threading,time
 import asyncio,struct,fcntl,termios,pty,hashlib
+sys.path.insert(0,'/tmp')
+import cfginit
 CONFIG='/app/config.yaml'
 STATUS='/tmp/serve_status.json'
 DOWNLOADER_FILE='/app/downloader'
@@ -146,6 +148,7 @@ class H(BaseHTTPRequestHandler):
         self.send_response(200);self.send_header('Content-Type',ct);self.send_header('Content-Length',len(b));self.end_headers();self.wfile.write(b)
     def do_GET(self):
         if self.path=='/config': self.ok(open(CONFIG,'rb').read(),'text/yaml')
+        elif self.path=='/params': self.ok(json.dumps(cfginit.load_params()).encode(),'application/json')
         elif self.path=='/status': self.ok(json.dumps(get_status()).encode(),'application/json')
         elif self.path=='/running': self.ok(json.dumps({'model':get_running()}).encode(),'application/json')
         elif self.path=='/downloader':
@@ -221,6 +224,29 @@ class H(BaseHTTPRequestHandler):
                     print(f'[cfgedit] regen failed: {r.stderr}',flush=True)
             except Exception as e:
                 self.ok(str(e).encode()); print(f'[cfgedit] regen error: {e}',flush=True)
+        elif self.path=='/params':
+            try:
+                params=cfginit.save_params(json.loads(body.decode()))
+                cfg,found=cfginit.build_config(params)
+                open(CONFIG,'w').write(cfg)
+                unload_all()
+                print(f'[cfgedit] params saved, regenerated config with {found} model(s)',flush=True)
+                self.ok(cfg.encode(),'text/yaml')
+            except Exception as e:
+                self.send_response(400);self.end_headers();self.wfile.write(str(e).encode())
+                print(f'[cfgedit] params error: {e}',flush=True)
+        elif self.path=='/params/reset':
+            try:
+                if os.path.exists(cfginit.PARAMS_FILE): os.remove(cfginit.PARAMS_FILE)
+                params=cfginit.load_params()
+                cfg,found=cfginit.build_config(params)
+                open(CONFIG,'w').write(cfg)
+                unload_all()
+                print(f'[cfgedit] params reset to env defaults, {found} model(s)',flush=True)
+                self.ok(json.dumps(params).encode(),'application/json')
+            except Exception as e:
+                self.send_response(400);self.end_headers();self.wfile.write(str(e).encode())
+                print(f'[cfgedit] params reset error: {e}',flush=True)
         else: self.send_response(404);self.end_headers()
     def _ui(self):
         d=open(CONFIG,'r').read().replace('&','&amp;').replace('<','&lt;')
@@ -263,7 +289,30 @@ class H(BaseHTTPRequestHandler):
 <span id=msg style="font-size:12px;color:#888"></span>
 </div>
 <small>p1=max ctx single user | p2/p4=split ctx | p8=may OOM on single GPU</small><br>
+<h4 style="margin:10px 0 4px">Models</h4>
+<table id=mtbl style="width:100%;border-collapse:collapse;font-size:12px">
+<thead><tr style="text-align:left"><th style="width:34%">Model URL</th><th style="width:33%">MMPROJ URL (optional)</th><th style="width:30%">Draft/MTP URL (optional)</th><th></th></tr></thead>
+<tbody id=mrows></tbody>
+</table>
+<button onclick="addRow()">+ Add model</button>
+<h4 style="margin:14px 0 4px">Settings</h4>
+<div id=sgrid style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:6px 12px;font-size:12px">
+<label>HF_TOKEN<br><input type=password id=s_HF_TOKEN style="width:100%;box-sizing:border-box"></label>
+<label>DOWNLOADER<br><select id=s_DOWNLOADER style="width:100%"><option value="">env default</option><option value="aria2c">aria2c</option><option value="hf">hf (Xet)</option></select></label>
+<label>HF_BACKEND<br><select id=s_HF_BACKEND style="width:100%"><option value="">env default</option><option value="hf_xet">hf_xet</option><option value="hf_transfer">hf_transfer</option></select></label>
+<label>CACHE_TYPE_K<br><select id=s_CACHE_TYPE_K style="width:100%"></select></label>
+<label>CACHE_TYPE_V<br><select id=s_CACHE_TYPE_V style="width:100%"></select></label>
+<label>GPU_LAYERS<br><input id=s_GPU_LAYERS style="width:100%;box-sizing:border-box" placeholder="99"></label>
+<label>MLOCK<br><select id=s_MLOCK style="width:100%"><option value="">env default</option><option value="0">0</option><option value="1">1</option></select></label>
+<label>IMAGE_MIN_TOKENS<br><input id=s_IMAGE_MIN_TOKENS style="width:100%;box-sizing:border-box" placeholder="560"></label>
+<label>IMAGE_MAX_TOKENS<br><input id=s_IMAGE_MAX_TOKENS style="width:100%;box-sizing:border-box" placeholder="2240"></label>
+<label>COMPUTE_FRACTION<br><input id=s_COMPUTE_FRACTION style="width:100%;box-sizing:border-box" placeholder="0.12"></label>
+</div>
+<div style="margin:10px 0"><button onclick="saveParams()">Save &amp; Regenerate</button><button onclick="resetParams()">Reset to env defaults</button><span id=pmsg style="font-size:12px;color:#888;margin-left:6px"></span></div>
+<details id=raw style="margin-top:6px"><summary style="cursor:pointer;user-select:none;font-size:12px;color:#555">&#9658; Advanced: raw config.yaml (overwritten by Save &amp; Regenerate above)</summary>
 <textarea id=cfg>{d}</textarea>
+<div style="margin:4px 0"><button onclick="doSave()">Save raw &amp; Reload</button></div>
+</details>
 <details id=sd><summary style="cursor:pointer;user-select:none;margin-top:4px">&#9658; Model output (serve &middot; aria2c &middot; llama-server)</summary>
 <div style="margin:2px 0"><button id=slpb onclick="slPaused=!slPaused;this.textContent=slPaused?'&#9654; Resume':'&#9208; Pause'" style="margin:2px;padding:2px 8px;font-family:monospace">&#9208; Pause</button>
 <label><input type=checkbox id=slas checked> auto-scroll</label></div>
@@ -279,6 +328,64 @@ function doUnload(){{fetch(E+'/unload',{{method:'POST'}}).then(()=>M.textContent
 function doRegen(){{M.textContent='regenerating...';fetch(E+'/regen',{{method:'POST'}}).then(r=>r.text()).then(t=>{{document.getElementById('cfg').value=t;M.textContent='✓ config regenerated — save to apply';}}).catch(e=>M.textContent='✗ '+e)}}
 function doUpdate(){{M.textContent='updating...';fetch(E+'/update',{{method:'POST'}}).then(()=>{{M.textContent='restarting...';var t=Date.now();(function wait(){{fetch(E+'/status',{{cache:'no-store'}}).then(()=>location.href=location.pathname).catch(()=>{{if(Date.now()-t<30000)setTimeout(wait,800);else location.href=location.pathname;}});}})();}}).catch(()=>{{M.textContent='restarting...';setTimeout(()=>location.href=location.pathname,6000);}})}}
 function doSave(){{M.textContent='saving...';lastSaveTs=Date.now()/1000;fetch(E+'/config',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:'cfg='+encodeURIComponent(document.getElementById('cfg').value)}}).then(r=>M.textContent=r.ok?'✓ saved':'✗ '+r.status)}}
+var CACHE_OPTS=['f16','q8_0','q4_0','q4_1','q5_0','q5_1','f32'];
+function esc(s){{return String(s==null?'':s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');}}
+function cacheOptsHtml(sel){{return '<option value="">env default</option>'+CACHE_OPTS.map(function(o){{return '<option value="'+o+'"'+(sel===o?' selected':'')+'>'+o+(o==='q8_0'?' (default)':'')+'</option>';}}).join('');}}
+document.getElementById('s_CACHE_TYPE_K').innerHTML=cacheOptsHtml('');
+document.getElementById('s_CACHE_TYPE_V').innerHTML=cacheOptsHtml('');
+function rowHtml(m){{
+  m=m||{{}};
+  return '<tr><td><input type=text class=murl value="'+esc(m.model_url)+'" style="width:100%;box-sizing:border-box" placeholder="https://huggingface.co/.../model.gguf"></td>'+
+  '<td><input type=text class=mmurl value="'+esc(m.mmproj_url)+'" style="width:100%;box-sizing:border-box" placeholder="(optional)"></td>'+
+  '<td><input type=text class=dmurl value="'+esc(m.draft_model_url)+'" style="width:100%;box-sizing:border-box" placeholder="(optional)"></td>'+
+  '<td><button onclick="this.closest(\\'tr\\').remove()" style="padding:2px 8px">&times;</button></td></tr>';
+}}
+function addRow(m){{document.getElementById('mrows').insertAdjacentHTML('beforeend',rowHtml(m));}}
+function fillSettings(s){{
+  s=s||{{}};
+  ['HF_TOKEN','DOWNLOADER','HF_BACKEND','CACHE_TYPE_K','CACHE_TYPE_V','GPU_LAYERS','MLOCK','IMAGE_MIN_TOKENS','IMAGE_MAX_TOKENS','COMPUTE_FRACTION'].forEach(function(k){{
+    var el=document.getElementById('s_'+k); if(el) el.value=s[k]||'';
+  }});
+}}
+function collectParams(){{
+  var models=[].slice.call(document.querySelectorAll('#mrows tr')).map(function(tr){{
+    return {{model_url:tr.querySelector('.murl').value.trim(),
+             mmproj_url:tr.querySelector('.mmurl').value.trim(),
+             draft_model_url:tr.querySelector('.dmurl').value.trim()}};
+  }}).filter(function(m){{return m.model_url;}});
+  var settings={{}};
+  ['HF_TOKEN','DOWNLOADER','HF_BACKEND','CACHE_TYPE_K','CACHE_TYPE_V','GPU_LAYERS','MLOCK','IMAGE_MIN_TOKENS','IMAGE_MAX_TOKENS','COMPUTE_FRACTION'].forEach(function(k){{
+    settings[k]=document.getElementById('s_'+k).value.trim();
+  }});
+  return {{models:models,settings:settings}};
+}}
+function loadParams(){{
+  fetch(E+'/params').then(r=>r.json()).then(p=>{{
+    document.getElementById('mrows').innerHTML='';
+    (p.models||[]).forEach(addRow);
+    if(!p.models||!p.models.length) addRow();
+    fillSettings(p.settings);
+  }}).catch(()=>addRow());
+}}
+function saveParams(){{
+  var pm=document.getElementById('pmsg');pm.textContent='saving...';lastSaveTs=Date.now()/1000;
+  fetch(E+'/params',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(collectParams())}})
+    .then(r=>r.text().then(t=>({{ok:r.ok,t:t}})))
+    .then(res=>{{if(res.ok){{document.getElementById('cfg').value=res.t;pm.textContent='✓ saved & regenerated';}}else{{pm.textContent='✗ '+res.t;}}}})
+    .catch(e=>pm.textContent='✗ '+e);
+}}
+function resetParams(){{
+  if(!confirm('Discard saved params and regenerate from the container env vars?'))return;
+  var pm=document.getElementById('pmsg');pm.textContent='resetting...';lastSaveTs=Date.now()/1000;
+  fetch(E+'/params/reset',{{method:'POST'}}).then(r=>r.json()).then(p=>{{
+    document.getElementById('mrows').innerHTML='';
+    (p.models||[]).forEach(addRow);
+    if(!p.models||!p.models.length) addRow();
+    fillSettings(p.settings);
+    return fetch(E+'/config').then(r=>r.text()).then(t=>document.getElementById('cfg').value=t);
+  }}).then(()=>pm.textContent='✓ reset to env defaults').catch(e=>pm.textContent='✗ '+e);
+}}
+loadParams();
 function age(ts){{if(!ts)return'';var d=Math.floor(Date.now()/1000-ts);if(d<5)return' (just now)';if(d<60)return' ('+d+'s ago)';if(d<3600)return' ('+Math.floor(d/60)+'m ago)';return' ('+Math.floor(d/3600)+'h ago)';}}
 function poll(){{
   Promise.all([fetch(E+'/status').then(r=>r.json()),fetch(E+'/running').then(r=>r.json())])
