@@ -5,6 +5,7 @@ sys.path.insert(0,'/tmp')
 import cfginit
 CONFIG='/app/config.yaml'
 STATUS='/tmp/serve_status.json'
+MODEL_DIR='/models'
 DOWNLOADER_FILE='/app/downloader'
 DEFAULT_MODEL_FILE='/app/default_model'
 CACHE_TYPE_FILE='/app/cache_type'
@@ -56,6 +57,33 @@ def unload_all():
     print(f'[cfgedit] unload: {s}',flush=True)
     try: os.remove(STATUS)
     except: pass
+
+def _is_active(fp):
+    try:
+        pid=int(open(fp+'.pid').read())
+        return os.path.exists(f'/proc/{pid}')
+    except: return False
+
+def list_cache():
+    out=[]
+    try:
+        for f in sorted(os.listdir(MODEL_DIR)):
+            if f.endswith('.pid') or f.endswith('.aria2'): continue
+            fp=os.path.join(MODEL_DIR,f)
+            if not os.path.isfile(fp): continue
+            out.append({'name':f,'size':os.path.getsize(fp),'active':_is_active(fp)})
+    except FileNotFoundError: pass
+    return out
+
+def purge_cache_file(name):
+    if not name or name!=os.path.basename(name) or name in ('.','..'): return False
+    fp=os.path.join(MODEL_DIR,name)
+    removed=os.path.isfile(fp)
+    if removed: os.remove(fp)
+    for sfx in ('.pid','.aria2'):
+        try: os.remove(fp+sfx)
+        except: pass
+    return removed
 
 def _preload(model):
     time.sleep(1)
@@ -151,6 +179,7 @@ class H(BaseHTTPRequestHandler):
         elif self.path=='/params': self.ok(json.dumps(cfginit.load_params()).encode(),'application/json')
         elif self.path=='/status': self.ok(json.dumps(get_status()).encode(),'application/json')
         elif self.path=='/running': self.ok(json.dumps({'model':get_running()}).encode(),'application/json')
+        elif self.path=='/cache': self.ok(json.dumps(list_cache()).encode(),'application/json')
         elif self.path=='/downloader':
             cur=open(DOWNLOADER_FILE).read().strip() if os.path.exists(DOWNLOADER_FILE) else 'env default'
             self.ok(cur.encode())
@@ -184,6 +213,20 @@ class H(BaseHTTPRequestHandler):
             cfg=urllib.parse.parse_qs(body.decode()).get('cfg',[''])[0]
             unload_all();open(CONFIG,'w').write(cfg);self.ok(b'OK\n')
         elif self.path=='/unload': unload_all();self.ok(b'OK\n')
+        elif self.path=='/cache/purge':
+            try:
+                req=json.loads(body.decode()) if body else {}
+                unload_all()
+                if req.get('all'):
+                    purged=[f['name'] for f in list_cache() if purge_cache_file(f['name'])]
+                else:
+                    name=(req.get('file') or '').strip()
+                    purged=[name] if purge_cache_file(name) else []
+                print(f'[cfgedit] cache purge: {purged}',flush=True)
+                self.ok(json.dumps({'purged':purged}).encode(),'application/json')
+            except Exception as e:
+                self.send_response(400);self.end_headers();self.wfile.write(str(e).encode())
+                print(f'[cfgedit] cache purge error: {e}',flush=True)
         elif self.path=='/downloader':
             v=body.decode().strip()
             if v: open(DOWNLOADER_FILE,'w').write(v)
@@ -295,6 +338,11 @@ class H(BaseHTTPRequestHandler):
 <tbody id=mrows></tbody>
 </table>
 <button onclick="addRow()">+ Add model</button>
+<h4 style="margin:14px 0 4px">Cached model files <button onclick="doPurgeAll()" style="color:#a00">Purge all</button> <button onclick="loadCache()" style="font-size:11px">&#8635;</button></h4>
+<table id=ctbl style="width:100%;border-collapse:collapse;font-size:12px">
+<thead><tr style="text-align:left"><th style="width:60%">File</th><th style="width:15%">Size</th><th style="width:15%">Status</th><th></th></tr></thead>
+<tbody id=crows><tr><td colspan=4><small>loading...</small></td></tr></tbody>
+</table>
 <h4 style="margin:14px 0 4px">Settings</h4>
 <div id=sgrid style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:6px 12px;font-size:12px">
 <label>HF_TOKEN<br><input type=password id=s_HF_TOKEN style="width:100%;box-sizing:border-box"></label>
@@ -386,6 +434,34 @@ function resetParams(){{
   }}).then(()=>pm.textContent='✓ reset to env defaults').catch(e=>pm.textContent='✗ '+e);
 }}
 loadParams();
+function fmtSize(n){{if(n>=1073741824)return(n/1073741824).toFixed(1)+'G';if(n>=1048576)return(n/1048576).toFixed(0)+'M';return(n/1024).toFixed(0)+'K';}}
+function loadCache(){{
+  fetch(E+'/cache').then(r=>r.json()).then(files=>{{
+    var tb=document.getElementById('crows');
+    if(!files.length){{tb.innerHTML='<tr><td colspan=4><small>(no cached files)</small></td></tr>';return;}}
+    tb.innerHTML=files.map(function(f){{
+      return '<tr><td style="word-break:break-all">'+esc(f.name)+'</td><td>'+fmtSize(f.size)+'</td><td>'+(f.active?'in use':'')+'</td>'+
+      '<td><button onclick="doPurgeOne('+esc(JSON.stringify(f.name))+')" style="padding:2px 8px">&times;</button></td></tr>';
+    }}).join('');
+  }}).catch(()=>{{document.getElementById('crows').innerHTML='<tr><td colspan=4><small>error loading cache</small></td></tr>';}});
+}}
+function doPurgeOne(name){{
+  if(!confirm('Delete cached file "'+name+'" from disk? This unloads the running model and cannot be undone.'))return;
+  M.textContent='purging...';
+  fetch(E+'/cache/purge',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{file:name}})}})
+    .then(r=>r.text().then(t=>({{ok:r.ok,t:t}})))
+    .then(res=>{{M.textContent=res.ok?'✓ purged '+name:'✗ '+res.t;loadCache();}})
+    .catch(e=>M.textContent='✗ '+e);
+}}
+function doPurgeAll(){{
+  if(!confirm('Delete ALL cached model files from disk? This unloads the running model and cannot be undone.'))return;
+  M.textContent='purging all...';
+  fetch(E+'/cache/purge',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{all:true}})}})
+    .then(r=>r.text().then(t=>({{ok:r.ok,t:t}})))
+    .then(res=>{{M.textContent=res.ok?'✓ purged all cached files':'✗ '+res.t;loadCache();}})
+    .catch(e=>M.textContent='✗ '+e);
+}}
+loadCache();
 function age(ts){{if(!ts)return'';var d=Math.floor(Date.now()/1000-ts);if(d<5)return' (just now)';if(d<60)return' ('+d+'s ago)';if(d<3600)return' ('+Math.floor(d/60)+'m ago)';return' ('+Math.floor(d/3600)+'h ago)';}}
 function poll(){{
   Promise.all([fetch(E+'/status').then(r=>r.json()),fetch(E+'/running').then(r=>r.json())])
