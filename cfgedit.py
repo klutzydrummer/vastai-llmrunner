@@ -354,6 +354,7 @@ class H(BaseHTTPRequestHandler):
 <label>MLOCK<br><select id=s_MLOCK style="width:100%"><option value="">env default</option><option value="0">0</option><option value="1">1</option></select></label>
 <label>IMAGE_MIN_TOKENS<br><input id=s_IMAGE_MIN_TOKENS style="width:100%;box-sizing:border-box" placeholder="560"></label>
 <label>IMAGE_MAX_TOKENS<br><input id=s_IMAGE_MAX_TOKENS style="width:100%;box-sizing:border-box" placeholder="2240"></label>
+<label>MTMD_BATCH_MAX_TOKENS<br><input id=s_MTMD_BATCH_MAX_TOKENS style="width:100%;box-sizing:border-box" placeholder="1024 (raise for video)"></label>
 <label>COMPUTE_FRACTION<br><input id=s_COMPUTE_FRACTION style="width:100%;box-sizing:border-box" placeholder="0.12"></label>
 </div>
 <div style="margin:10px 0"><button onclick="saveParams()">Save &amp; Regenerate</button><button onclick="resetParams()">Reset to env defaults</button><span id=pmsg style="font-size:12px;color:#888;margin-left:6px"></span></div>
@@ -391,7 +392,7 @@ function rowHtml(m){{
 function addRow(m){{document.getElementById('mrows').insertAdjacentHTML('beforeend',rowHtml(m));}}
 function fillSettings(s){{
   s=s||{{}};
-  ['HF_TOKEN','DOWNLOADER','HF_BACKEND','CACHE_TYPE_K','CACHE_TYPE_V','GPU_LAYERS','MLOCK','IMAGE_MIN_TOKENS','IMAGE_MAX_TOKENS','COMPUTE_FRACTION'].forEach(function(k){{
+  ['HF_TOKEN','DOWNLOADER','HF_BACKEND','CACHE_TYPE_K','CACHE_TYPE_V','GPU_LAYERS','MLOCK','IMAGE_MIN_TOKENS','IMAGE_MAX_TOKENS','MTMD_BATCH_MAX_TOKENS','COMPUTE_FRACTION'].forEach(function(k){{
     var el=document.getElementById('s_'+k); if(el) el.value=s[k]||'';
   }});
 }}
@@ -402,7 +403,7 @@ function collectParams(){{
              draft_model_url:tr.querySelector('.dmurl').value.trim()}};
   }}).filter(function(m){{return m.model_url;}});
   var settings={{}};
-  ['HF_TOKEN','DOWNLOADER','HF_BACKEND','CACHE_TYPE_K','CACHE_TYPE_V','GPU_LAYERS','MLOCK','IMAGE_MIN_TOKENS','IMAGE_MAX_TOKENS','COMPUTE_FRACTION'].forEach(function(k){{
+  ['HF_TOKEN','DOWNLOADER','HF_BACKEND','CACHE_TYPE_K','CACHE_TYPE_V','GPU_LAYERS','MLOCK','IMAGE_MIN_TOKENS','IMAGE_MAX_TOKENS','MTMD_BATCH_MAX_TOKENS','COMPUTE_FRACTION'].forEach(function(k){{
     settings[k]=document.getElementById('s_'+k).value.trim();
   }});
   return {{models:models,settings:settings}};

@@ -2,7 +2,8 @@ import os, json
 
 PARAMS_FILE = "/app/params.json"
 PASS_KEYS = ["HF_TOKEN","DOWNLOADER","HF_BACKEND","CACHE_TYPE_K","CACHE_TYPE_V",
-             "GPU_LAYERS","MLOCK","IMAGE_MIN_TOKENS","IMAGE_MAX_TOKENS","COMPUTE_FRACTION"]
+             "GPU_LAYERS","MLOCK","IMAGE_MIN_TOKENS","IMAGE_MAX_TOKENS",
+             "MTMD_BATCH_MAX_TOKENS","COMPUTE_FRACTION"]
 
 def _env_params():
     models = []
