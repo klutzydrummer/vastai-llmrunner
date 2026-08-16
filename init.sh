@@ -65,6 +65,20 @@ install_pip_deps(){
     fi
 }
 
+# ── ffmpeg (required by llama.cpp's mtmd video input; it shells out to ffmpeg
+#    to decode video frames) ────────────────────────────────────────────────────
+install_ffmpeg(){
+    if command -v ffmpeg >/dev/null 2>&1; then
+        LOG "ffmpeg already installed"
+        return 0
+    fi
+    LOG "installing ffmpeg"
+    apt-get update -qq && apt-get install -y -qq ffmpeg \
+        || die "ffmpeg install failed"
+    command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg not in PATH after install"
+    LOG "ffmpeg installed OK"
+}
+
 # ── binary installer ──────────────────────────────────────────────────────────
 # get_latest_tag REPO  →  prints tag (e.g. v211, 2026.3.0)
 get_latest_tag(){
@@ -291,6 +305,7 @@ main(){
     update_scripts || LOG "warn: some scripts failed to update, continuing with existing versions"
 
     install_pip_deps
+    install_ffmpeg
 
     # llama-swap: tag=v211 → ver=211 → llama-swap_211_linux_amd64.tar.gz
     download_bin llama-swap \
