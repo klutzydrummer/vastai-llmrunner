@@ -39,7 +39,7 @@ wait_port(){
 update_scripts(){
     local base="https://raw.githubusercontent.com/klutzydrummer/vastai-llmrunner/main"
     local f failed=0
-    for f in serve.py cfginit.py cfgedit.py guard.py; do
+    for f in serve.py cfginit.py cfgedit.py guard.py embed.py; do
         if curl -fsSL --max-time 30 "$base/$f" -o "/tmp/$f"; then
             LOG "updated $f"
         else
@@ -160,18 +160,14 @@ gen_config(){
     LOG "config.yaml written ($(wc -l < /app/config.yaml) lines)"
 }
 
-# ── optional embed model ──────────────────────────────────────────────────────
+# ── embeddings sidecar ────────────────────────────────────────────────────────
+# embed.py runs its own llama-server outside llama-swap, so embeddings stay up
+# while chat models are swapped. It self-configures from /app/params.json (the
+# cfgedit UI) and falls back to EMBED_MODEL_URL; it exits quietly if unset.
 start_embed(){
-    [ -z "${EMBED_MODEL_URL:-}" ] && return 0
-    LOG "starting embed model"
-    local name
-    name=$(printf '%s' "$EMBED_MODEL_URL" | md5sum | cut -c1-8)_$(basename "$EMBED_MODEL_URL")
-    aria2c -x16 -s16 --file-allocation=none -d /models -o "$name" \
-        ${HF_TOKEN:+--header="Authorization: Bearer $HF_TOKEN"} \
-        "$EMBED_MODEL_URL" \
-    && llama-server --model /models/"$name" --port 8090 --embedding \
-        -ngl 0 -c 8192 -b 8192 --rope-scaling yarn --rope-freq-scale .75 \
-        >/tmp/embed.log 2>&1 &
+    LOG "starting embeddings sidecar"
+    python3 /tmp/embed.py > /tmp/embed.log 2>&1 &
+    EMBED_PID=$!
 }
 
 # ── service startup ───────────────────────────────────────────────────────────
@@ -201,7 +197,13 @@ start_services(){
     uri strip_prefix /editor
     reverse_proxy localhost:5005
   }
+  # Embeddings sidecar. /v1/embeddings is the OpenAI-compatible form (used by
+  # SillyTavern's "vllm"/OpenAI-compatible vector sources); /embedding is
+  # llama.cpp's native form (used by SillyTavern's "llamacpp" vector source).
   handle /v1/embeddings* {
+    reverse_proxy localhost:8090
+  }
+  handle /embedding* {
     reverse_proxy localhost:8090
   }
   handle /ui* {

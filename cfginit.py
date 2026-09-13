@@ -4,6 +4,10 @@ PARAMS_FILE = "/app/params.json"
 PASS_KEYS = ["HF_TOKEN","DOWNLOADER","HF_BACKEND","CACHE_TYPE_K","CACHE_TYPE_V",
              "GPU_LAYERS","MLOCK","IMAGE_MIN_TOKENS","IMAGE_MAX_TOKENS",
              "MTMD_BATCH_MAX_TOKENS","COMPUTE_FRACTION"]
+# Settings for the always-on embeddings sidecar (embed.py), which runs outside
+# llama-swap so embeddings stay available while chat models are swapped.
+EMBED_KEYS = ["EMBED_MODEL_URL","EMBED_GPU_LAYERS","EMBED_CTX","EMBED_POOLING",
+              "EMBED_PARALLEL","EMBED_EXTRA_ARGS"]
 
 def _env_params():
     models = []
@@ -18,7 +22,8 @@ def _env_params():
             "draft_model_url": os.environ.get(f"DRAFT_MODEL_URL{sfx}", ""),
         })
     settings = {k: os.environ.get(k, "") for k in PASS_KEYS}
-    return {"models": models, "settings": settings}
+    embedding = {k: os.environ.get(k, "") for k in EMBED_KEYS}
+    return {"models": models, "settings": settings, "embedding": embedding}
 
 def load_params():
     """Params saved via the cfgedit UI (/app/params.json) take priority over
@@ -32,6 +37,12 @@ def load_params():
                 p.setdefault("settings", {})
                 for k in PASS_KEYS:
                     p["settings"].setdefault(k, "")
+                # params.json files written before embeddings existed have no
+                # "embedding" block — seed it from the env so EMBED_MODEL_URL
+                # keeps working after an upgrade.
+                p.setdefault("embedding", {})
+                for k in EMBED_KEYS:
+                    p["embedding"].setdefault(k, os.environ.get(k, ""))
                 return p
         except Exception:
             pass
@@ -43,7 +54,8 @@ def save_params(params):
                "draft_model_url": (m.get("draft_model_url") or "").strip()}
               for m in params.get("models", []) if (m.get("model_url") or "").strip()]
     settings = {k: (params.get("settings", {}).get(k) or "").strip() for k in PASS_KEYS}
-    p = {"models": models, "settings": settings}
+    embedding = {k: (params.get("embedding", {}).get(k) or "").strip() for k in EMBED_KEYS}
+    p = {"models": models, "settings": settings, "embedding": embedding}
     open(PARAMS_FILE, "w").write(json.dumps(p, indent=2))
     return p
 

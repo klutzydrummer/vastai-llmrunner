@@ -11,7 +11,26 @@ DEFAULT_MODEL_FILE='/app/default_model'
 CACHE_TYPE_FILE='/app/cache_type'
 LLAMA_SWAP_HOST='localhost'; LLAMA_SWAP_PORT=8080
 SCRIPTS_BASE='https://raw.githubusercontent.com/klutzydrummer/vastai-llmrunner/main'
-SCRIPTS=['serve.py','cfgedit.py','guard.py','cfginit.py','init.sh']
+SCRIPTS=['serve.py','cfgedit.py','guard.py','cfginit.py','embed.py','init.sh']
+EMBED_STATUS='/tmp/embed_status.json'
+EMBED_PORT=8090
+# Suggested small embedding models. All are GGUF; pick one in the UI or paste
+# any other .gguf URL. "pooling" is only set where the model needs a value that
+# llama.cpp may not infer from the GGUF metadata.
+EMBED_PRESETS=[
+  {'label':'Qwen3-Embedding-0.6B Q8_0 — best quality/size (1024 dim, multilingual)',
+   'url':'https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf',
+   'pooling':'last'},
+  {'label':'EmbeddingGemma-300M Q8_0 — smaller, strong for its size (768 dim)',
+   'url':'https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF/resolve/main/embeddinggemma-300M-Q8_0.gguf',
+   'pooling':'mean'},
+  {'label':'nomic-embed-text-v1.5 Q8_0 — long context (768 dim)',
+   'url':'https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf',
+   'pooling':'mean'},
+  {'label':'bge-small-en-v1.5 Q8_0 — tiny, English only (384 dim)',
+   'url':'https://huggingface.co/CompendiumLabs/bge-small-en-v1.5-gguf/resolve/main/bge-small-en-v1.5-q8_0.gguf',
+   'pooling':'cls'},
+]
 LOGS={'guard':'/tmp/guard.log','llama-swap':'/tmp/llama-swap.log',
       'caddy':'/tmp/caddy.log','cfgedit':'/tmp/cfgedit.log','cloudflared':'/tmp/cloudflared.log'}
 
@@ -97,6 +116,39 @@ def _preload(model):
     except Exception as e:
         print(f'[cfgedit] preload error: {e}',flush=True)
 
+def embed_status():
+    base={'status':'disabled'}
+    if os.path.exists(EMBED_STATUS):
+        try: base=json.loads(open(EMBED_STATUS).read())
+        except: pass
+    return base
+
+def restart_embed():
+    """Restart the embeddings sidecar so config changes take effect.
+
+    The llama-server child is killed explicitly too — otherwise it survives its
+    parent and keeps :8090 bound, so the fresh sidecar can't start."""
+    subprocess.run(['pkill','-f','/tmp/embed.py'],check=False)
+    subprocess.run(['pkill','-f','llama-server .*--embedding'],check=False)
+    time.sleep(1)
+    subprocess.Popen([sys.executable,'/tmp/embed.py'],
+                     stdout=open('/tmp/embed.log','a'),stderr=subprocess.STDOUT)
+    print('[cfgedit] embeddings sidecar restarted',flush=True)
+
+def embed_test(text='SillyTavern vector storage test'):
+    try:
+        body=json.dumps({'input':text}).encode()
+        c=http.client.HTTPConnection('localhost',EMBED_PORT,timeout=180)
+        c.request('POST','/v1/embeddings',body=body,headers={'Content-Type':'application/json'})
+        r=c.getresponse(); d=r.read(); c.close()
+        if r.status!=200:
+            return {'ok':False,'error':f'HTTP {r.status}: {d.decode("utf-8","replace")[:300]}'}
+        j=json.loads(d); emb=j['data'][0]['embedding']
+        while emb and isinstance(emb[0],list): emb=emb[0]
+        return {'ok':True,'dim':len(emb),'model':j.get('model','')}
+    except Exception as e:
+        return {'ok':False,'error':str(e)}
+
 def get_running():
     s,d=llama_swap('GET','/running')
     if s==200:
@@ -180,6 +232,7 @@ class H(BaseHTTPRequestHandler):
         elif self.path=='/status': self.ok(json.dumps(get_status()).encode(),'application/json')
         elif self.path=='/running': self.ok(json.dumps({'model':get_running()}).encode(),'application/json')
         elif self.path=='/cache': self.ok(json.dumps(list_cache()).encode(),'application/json')
+        elif self.path=='/embed/status': self.ok(json.dumps(embed_status()).encode(),'application/json')
         elif self.path=='/downloader':
             cur=open(DOWNLOADER_FILE).read().strip() if os.path.exists(DOWNLOADER_FILE) else 'env default'
             self.ok(cur.encode())
@@ -251,6 +304,11 @@ class H(BaseHTTPRequestHandler):
                 threading.Thread(target=_preload,args=(v,),daemon=True).start()
                 print(f'[cfgedit] load: {v}',flush=True);self.ok(b'OK\n')
             else: self.send_response(400);self.end_headers()
+        elif self.path=='/embed/restart':
+            threading.Thread(target=restart_embed,daemon=True).start()
+            self.ok(b'OK\n')
+        elif self.path=='/embed/test':
+            self.ok(json.dumps(embed_test()).encode(),'application/json')
         elif self.path=='/update':
             self.ok(b'OK\n')
             threading.Thread(target=update_scripts,daemon=True).start()
@@ -269,10 +327,13 @@ class H(BaseHTTPRequestHandler):
                 self.ok(str(e).encode()); print(f'[cfgedit] regen error: {e}',flush=True)
         elif self.path=='/params':
             try:
+                before=cfginit.load_params().get('embedding',{})
                 params=cfginit.save_params(json.loads(body.decode()))
                 cfg,found=cfginit.build_config(params)
                 open(CONFIG,'w').write(cfg)
                 unload_all()
+                if params.get('embedding',{})!=before:
+                    threading.Thread(target=restart_embed,daemon=True).start()
                 print(f'[cfgedit] params saved, regenerated config with {found} model(s)',flush=True)
                 self.ok(cfg.encode(),'text/yaml')
             except Exception as e:
@@ -285,6 +346,7 @@ class H(BaseHTTPRequestHandler):
                 cfg,found=cfginit.build_config(params)
                 open(CONFIG,'w').write(cfg)
                 unload_all()
+                threading.Thread(target=restart_embed,daemon=True).start()
                 print(f'[cfgedit] params reset to env defaults, {found} model(s)',flush=True)
                 self.ok(json.dumps(params).encode(),'application/json')
             except Exception as e:
@@ -357,6 +419,20 @@ class H(BaseHTTPRequestHandler):
 <label>MTMD_BATCH_MAX_TOKENS<br><input id=s_MTMD_BATCH_MAX_TOKENS style="width:100%;box-sizing:border-box" placeholder="1024 (raise for video)"></label>
 <label>COMPUTE_FRACTION<br><input id=s_COMPUTE_FRACTION style="width:100%;box-sizing:border-box" placeholder="0.12"></label>
 </div>
+<h4 style="margin:14px 0 4px">Embeddings <small style="font-weight:normal;color:#888">(always-on sidecar on :8090 &mdash; SillyTavern vector storage)</small></h4>
+<div id=estat style="padding:6px;background:#eee;font-size:12px;margin-bottom:4px">...</div>
+<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:6px 12px;font-size:12px">
+<label style="grid-column:1/-1">Preset<br><select id=e_preset onchange="applyPreset(this.value)" style="width:100%"></select></label>
+<label style="grid-column:1/-1">EMBED_MODEL_URL<br><input id=s_EMBED_MODEL_URL style="width:100%;box-sizing:border-box" placeholder="(blank = embeddings disabled)"></label>
+<label>EMBED_POOLING<br><select id=s_EMBED_POOLING style="width:100%"><option value="">auto (from GGUF)</option><option value="none">none</option><option value="mean">mean</option><option value="cls">cls</option><option value="last">last</option></select></label>
+<label>EMBED_CTX<br><input id=s_EMBED_CTX style="width:100%;box-sizing:border-box" placeholder="4096"></label>
+<label>EMBED_PARALLEL<br><input id=s_EMBED_PARALLEL style="width:100%;box-sizing:border-box" placeholder="2"></label>
+<label>EMBED_GPU_LAYERS<br><input id=s_EMBED_GPU_LAYERS style="width:100%;box-sizing:border-box" placeholder="0 = CPU, 99 = GPU"></label>
+<label style="grid-column:1/-1">EMBED_EXTRA_ARGS<br><input id=s_EMBED_EXTRA_ARGS style="width:100%;box-sizing:border-box" placeholder="extra llama-server flags, e.g. --rope-scaling yarn --rope-freq-scale .75"></label>
+</div>
+<div style="margin:6px 0"><button onclick="restartEmbed()">Restart embeddings</button><button onclick="testEmbed()">Test</button><span id=emsg style="font-size:12px;color:#888;margin-left:6px"></span></div>
+<small>Saving below applies these too. GPU layers 0 keeps VRAM free for the chat model; 99 is much faster and is subtracted from the chat model&#39;s VRAM budget.<br>
+SillyTavern &rarr; Vector Storage: source <b>vLLM</b> (or any OpenAI-compatible) with URL <span id=eurl>(this host)</span> and any model name &mdash; or source <b>llama.cpp</b> with the same URL. Text generation uses that same base URL.</small>
 <div style="margin:10px 0"><button onclick="saveParams()">Save &amp; Regenerate</button><button onclick="resetParams()">Reset to env defaults</button><span id=pmsg style="font-size:12px;color:#888;margin-left:6px"></span></div>
 <details id=raw style="margin-top:6px"><summary style="cursor:pointer;user-select:none;font-size:12px;color:#555">&#9658; Advanced: raw config.yaml (overwritten by Save &amp; Regenerate above)</summary>
 <textarea id=cfg>{d}</textarea>
@@ -390,6 +466,19 @@ function rowHtml(m){{
   '<td><button onclick="this.closest(\\'tr\\').remove()" style="padding:2px 8px">&times;</button></td></tr>';
 }}
 function addRow(m){{document.getElementById('mrows').insertAdjacentHTML('beforeend',rowHtml(m));}}
+function fillEmbedding(e){{
+  e=e||{{}};
+  EMBED_FIELDS.forEach(function(k){{
+    var el=document.getElementById('s_'+k); if(el) el.value=e[k]||'';
+  }});
+}}
+function collectEmbedding(){{
+  var o={{}};
+  EMBED_FIELDS.forEach(function(k){{
+    var el=document.getElementById('s_'+k); o[k]=el?el.value.trim():'';
+  }});
+  return o;
+}}
 function fillSettings(s){{
   s=s||{{}};
   ['HF_TOKEN','DOWNLOADER','HF_BACKEND','CACHE_TYPE_K','CACHE_TYPE_V','GPU_LAYERS','MLOCK','IMAGE_MIN_TOKENS','IMAGE_MAX_TOKENS','MTMD_BATCH_MAX_TOKENS','COMPUTE_FRACTION'].forEach(function(k){{
@@ -406,7 +495,7 @@ function collectParams(){{
   ['HF_TOKEN','DOWNLOADER','HF_BACKEND','CACHE_TYPE_K','CACHE_TYPE_V','GPU_LAYERS','MLOCK','IMAGE_MIN_TOKENS','IMAGE_MAX_TOKENS','MTMD_BATCH_MAX_TOKENS','COMPUTE_FRACTION'].forEach(function(k){{
     settings[k]=document.getElementById('s_'+k).value.trim();
   }});
-  return {{models:models,settings:settings}};
+  return {{models:models,settings:settings,embedding:collectEmbedding()}};
 }}
 function loadParams(){{
   fetch(E+'/params').then(r=>r.json()).then(p=>{{
@@ -414,6 +503,7 @@ function loadParams(){{
     (p.models||[]).forEach(addRow);
     if(!p.models||!p.models.length) addRow();
     fillSettings(p.settings);
+    fillEmbedding(p.embedding);
   }}).catch(()=>addRow());
 }}
 function saveParams(){{
@@ -431,8 +521,49 @@ function resetParams(){{
     (p.models||[]).forEach(addRow);
     if(!p.models||!p.models.length) addRow();
     fillSettings(p.settings);
+    fillEmbedding(p.embedding);
     return fetch(E+'/config').then(r=>r.text()).then(t=>document.getElementById('cfg').value=t);
   }}).then(()=>pm.textContent='✓ reset to env defaults').catch(e=>pm.textContent='✗ '+e);
+}}
+var EMBED_PRESETS={json.dumps(EMBED_PRESETS)};
+var EMBED_FIELDS={json.dumps(cfginit.EMBED_KEYS)};
+(function(){{
+  var sel=document.getElementById('e_preset');
+  sel.innerHTML='<option value="">(custom / leave URL as-is)</option>'+EMBED_PRESETS.map(function(p,i){{
+    return '<option value="'+i+'">'+esc(p.label)+'</option>';
+  }}).join('');
+  var u=document.getElementById('eurl'); if(u) u.textContent=location.origin;
+}})();
+function applyPreset(i){{
+  if(i==='')return;
+  var p=EMBED_PRESETS[+i]; if(!p)return;
+  document.getElementById('s_EMBED_MODEL_URL').value=p.url;
+  document.getElementById('s_EMBED_POOLING').value=p.pooling||'';
+  document.getElementById('emsg').textContent='preset filled in — press "Save & Regenerate" to apply';
+}}
+function restartEmbed(){{
+  var em=document.getElementById('emsg');em.textContent='restarting...';
+  fetch(E+'/embed/restart',{{method:'POST'}}).then(r=>em.textContent=r.ok?'✓ restarting sidecar':'✗ '+r.status)
+    .catch(e=>em.textContent='✗ '+e);
+}}
+function testEmbed(){{
+  var em=document.getElementById('emsg');em.textContent='testing...';
+  fetch(E+'/embed/test',{{method:'POST'}}).then(r=>r.json()).then(function(d){{
+    em.textContent=d.ok?('✓ embeddings OK — '+d.dim+' dimensions'):('✗ '+d.error);
+  }}).catch(e=>em.textContent='✗ '+e);
+}}
+function pollEmbed(){{
+  fetch(E+'/embed/status').then(r=>r.json()).then(function(s){{
+    var el=document.getElementById('estat'),st=s.status||'disabled',txt=st;
+    if(st==='disabled')txt='disabled — set EMBED_MODEL_URL below to enable';
+    else if(st==='ready')txt='ready — '+s.model+(s.dim?(' ('+s.dim+' dim)'):'')+' on :'+(s.port||8090);
+    else if(st==='downloading')txt='downloading '+s.model+' (attempt '+s.attempt+'/'+s.max_attempts+')';
+    else if(st==='loading')txt='loading '+s.model;
+    else if(st==='error')txt='error: '+s.error;
+    txt+=age(s.ts);
+    el.style.background={{'error':'#fee','ready':'#dfd','downloading':'#e8f0fe','loading':'#e8f0fe'}}[st]||'#eee';
+    el.textContent=txt;
+  }}).catch(()=>{{}});
 }}
 loadParams();
 function fmtSize(n){{if(n>=1073741824)return(n/1073741824).toFixed(1)+'G';if(n>=1048576)return(n/1048576).toFixed(0)+'M';return(n/1024).toFixed(0)+'K';}}
@@ -489,6 +620,7 @@ function poll(){{
   }}).catch(()=>{{}})
 }}
 poll();setInterval(poll,2000);
+pollEmbed();setInterval(pollEmbed,4000);
 </script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
 <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
