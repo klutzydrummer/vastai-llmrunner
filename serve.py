@@ -329,7 +329,18 @@ eb={'f16':2.0,'q8_0':1.0625,'q4_0':0.5,'q4_1':0.5625,'f32':4.0,'q5_0':0.625,'q5_
 wm=os.path.getsize(mp)/1048576*1.05
 pm2=os.path.getsize(mmp)/1048576*1.02 if mmp and os.path.isfile(mmp) else 0
 pdraft=os.path.getsize(dmp)/1048576*1.05 if dmp and os.path.isfile(dmp) else 0
-ndev=max(len(vrams),1);rem=(tv*0.88-wm-pm2-pdraft)*1048576
+def _embed_reserve_mb():
+    """VRAM already claimed by the always-on embeddings sidecar (embed.py), so
+    the chat model's budget doesn't count memory it can't actually have.
+    Returns 0 when the embedder is CPU-only or not running."""
+    try:
+        d=json.loads(open('/tmp/embed_status.json').read())
+        if d.get('status') in ('loading','ready'): return float(d.get('vram_mb') or 0)
+    except Exception: pass
+    return 0.0
+pembed=_embed_reserve_mb()
+if pembed: print(f'[serve] reserving {pembed:.0f}MB VRAM for embeddings sidecar',flush=True)
+ndev=max(len(vrams),1);rem=(tv*0.88-wm-pm2-pdraft-pembed)*1048576
 SAFETY=3.0;cpd=max(0.0,rem)*cf/ndev
 if cpd>0:
     ub_attn=math.sqrt(cpd/(nh*4*SAFETY));ub_ffn=cpd/(2*ffn*4*SAFETY)
@@ -350,7 +361,7 @@ vram_used_mb=int(wm+pm2+ctx*kpt/1048576+compute_total/1048576)
 n_ctx_train=scalar(P('context_length',ctx))
 print(f'[serve] arch={arch} nl={nl} nkv={nkv} nh={nh} nk={nk} hd={hd} ffn={ffn}',flush=True)
 print(f'[serve] ctx={ctx} per_slot={ctx//par} batch={batch} ubatch={ub} par={par}',flush=True)
-print(f'[serve] weights={wm:.0f}MB mmproj={pm2:.0f}MB draft={pdraft:.0f}MB kv={ctx*kpt/1048576:.0f}MB compute~{compute_total/1048576:.0f}MB',flush=True)
+print(f'[serve] weights={wm:.0f}MB mmproj={pm2:.0f}MB draft={pdraft:.0f}MB embed={pembed:.0f}MB kv={ctx*kpt/1048576:.0f}MB compute~{compute_total/1048576:.0f}MB',flush=True)
 write_status({'status':'loading','model':os.path.basename(mp),'ctx':ctx,'n_ctx_train':n_ctx_train,'n_ctx_per_slot':ctx//par,'vram_mb':vram_used_mb,'par':par,'port':int(PORT),'ts':int(time.time())})
 args=['--model',mp,'--ctx-size',str(ctx),'--batch-size',str(batch),'--ubatch-size',str(ub),'--parallel',str(par)]
 args+=['--host','0.0.0.0','--port',PORT]
