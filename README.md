@@ -36,6 +36,26 @@ the same time, from the same base URL.
 Re-vectorize your chats after changing the embedding model: different models
 produce different vector spaces and dimensions.
 
+## Exposing only the active model
+
+`/editor` has an **Expose only active model to /v1/models** checkbox. With it on,
+`/v1/models` lists just the model that is actually loaded (or, if nothing is
+loaded, the configured default model) instead of every `-p1`/`-p2`/`-p4`/`-p8`
+variant in `config.yaml`. Clients like SillyTavern then can't pick a model that
+would trigger a swap, and their model dropdown stays readable.
+
+It is off by default; the container env var `EXPOSE_ACTIVE_ONLY=1` turns it on
+at boot, and `/app/expose_active_only` (written by the UI) wins when present.
+The filter never hides everything: if neither a running nor a default model
+matches the listing, the full list is served as before.
+
+## Context length
+
+The status bar in `/editor` shows the loaded model's context — tokens per slot,
+total context, slot count, and the context the model was trained for — with a
+**copy context length** button that copies the per-slot number, which is the
+value to put in a client's context size setting.
+
 ## Configuring the embedding model
 
 In `/editor` → **Embeddings**, choose a preset or paste any GGUF URL, then
