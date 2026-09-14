@@ -9,6 +9,12 @@ INFO_PATHS={'/v1/internal/model/info','/props','/slots'}
 STATUS='/tmp/serve_status.json'
 DEFAULT_MODEL=os.environ.get('DEFAULT_MODEL','')
 DEFAULT_MODEL_FILE='/app/default_model'
+MODELS_PATH='/v1/models'
+# When on, /v1/models advertises only the model that is actually active
+# (running, else the configured default) instead of every entry in config.yaml.
+# Clients like SillyTavern then can't pick a model that would trigger a swap.
+EXPOSE_ACTIVE_ONLY_FILE='/app/expose_active_only'
+TRUTHY={'1','true','yes','on'}
 _cache={}
 
 def get_default_model():
@@ -17,6 +23,26 @@ def get_default_model():
         if v: return v
     except: pass
     return DEFAULT_MODEL
+
+def expose_active_only():
+    try:
+        v=open(EXPOSE_ACTIVE_ONLY_FILE).read().strip()
+        if v: return v.lower() in TRUTHY
+    except: pass
+    return os.environ.get('EXPOSE_ACTIVE_ONLY','').strip().lower() in TRUTHY
+
+def filter_models(raw,active):
+    """Keep only the active model in an OpenAI /v1/models listing.
+    Returns None (leave the upstream body alone) if it can't be applied."""
+    try:
+        d=json.loads(raw)
+        items=d.get('data')
+        if not isinstance(items,list): return None
+        keep=[m for m in items if isinstance(m,dict) and m.get('id')==active]
+        if not keep: return None
+        d['data']=keep
+        return json.dumps(d).encode()
+    except: return None
 
 class ThreadedHTTPServer(ThreadingMixIn,HTTPServer):
     daemon_threads=True
@@ -86,6 +112,16 @@ class G(BaseHTTPRequestHandler):
             c=http.client.HTTPConnection(UPSTREAM_HOST,UPSTREAM_PORT,timeout=600)
             c.request(self.command,self.path,body=body,headers=hdrs)
             r=c.getresponse()
+            if path==MODELS_PATH and self.command=='GET':
+                raw=r.read()
+                if r.status==200 and expose_active_only():
+                    active=get_running() or get_default_model()
+                    if active:
+                        filtered=filter_models(raw,active)
+                        if filtered is not None:
+                            print(f'[guard] /v1/models limited to {active!r}',flush=True)
+                            raw=filtered
+                self.buf_send(r.status,r.getheaders(),raw); c.close(); return
             if path in INFO_PATHS:
                 raw=r.read()
                 if r.status==200:

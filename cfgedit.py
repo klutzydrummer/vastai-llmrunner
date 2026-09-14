@@ -9,6 +9,10 @@ MODEL_DIR='/models'
 DOWNLOADER_FILE='/app/downloader'
 DEFAULT_MODEL_FILE='/app/default_model'
 CACHE_TYPE_FILE='/app/cache_type'
+# When set, guard.py trims /v1/models down to the active model only, so API
+# clients see a single entry instead of every variant in config.yaml.
+EXPOSE_ACTIVE_ONLY_FILE='/app/expose_active_only'
+TRUTHY={'1','true','yes','on'}
 LLAMA_SWAP_HOST='localhost'; LLAMA_SWAP_PORT=8080
 SCRIPTS_BASE='https://raw.githubusercontent.com/klutzydrummer/vastai-llmrunner/main'
 SCRIPTS=['serve.py','cfgedit.py','guard.py','cfginit.py','embed.py','init.sh']
@@ -149,6 +153,13 @@ def embed_test(text='SillyTavern vector storage test'):
     except Exception as e:
         return {'ok':False,'error':str(e)}
 
+def expose_active_only():
+    try:
+        v=open(EXPOSE_ACTIVE_ONLY_FILE).read().strip()
+        if v: return v.lower() in TRUTHY
+    except: pass
+    return os.environ.get('EXPOSE_ACTIVE_ONLY','').strip().lower() in TRUTHY
+
 def get_running():
     s,d=llama_swap('GET','/running')
     if s==200:
@@ -241,6 +252,8 @@ class H(BaseHTTPRequestHandler):
         elif self.path=='/cache_type':
             cur=open(CACHE_TYPE_FILE).read().strip() if os.path.exists(CACHE_TYPE_FILE) else 'env default'
             self.ok(cur.encode())
+        elif self.path=='/expose_active_only':
+            self.ok(json.dumps({'enabled':expose_active_only()}).encode(),'application/json')
         elif self.path=='/': self._ui()
         elif self.path=='/debug': self._debug_ui()
         elif self.path.startswith('/logfile'):
@@ -290,6 +303,11 @@ class H(BaseHTTPRequestHandler):
             if v: open(DEFAULT_MODEL_FILE,'w').write(v)
             elif os.path.exists(DEFAULT_MODEL_FILE): os.remove(DEFAULT_MODEL_FILE)
             print(f'[cfgedit] default_model: {v or "cleared"}',flush=True);self.ok(b'OK\n')
+        elif self.path=='/expose_active_only':
+            v=body.decode().strip().lower() in TRUTHY
+            if v: open(EXPOSE_ACTIVE_ONLY_FILE,'w').write('1')
+            elif os.path.exists(EXPOSE_ACTIVE_ONLY_FILE): os.remove(EXPOSE_ACTIVE_ONLY_FILE)
+            print(f'[cfgedit] expose_active_only: {v}',flush=True);self.ok(b'OK\n')
         elif self.path=='/cache_type':
             v=body.decode().strip()
             if v: open(CACHE_TYPE_FILE,'w').write(v)
@@ -358,16 +376,53 @@ class H(BaseHTTPRequestHandler):
         cur=open(DOWNLOADER_FILE).read().strip() if os.path.exists(DOWNLOADER_FILE) else ''
         cur_dm=open(DEFAULT_MODEL_FILE).read().strip() if os.path.exists(DEFAULT_MODEL_FILE) else ''
         cur_ct=open(CACHE_TYPE_FILE).read().strip() if os.path.exists(CACHE_TYPE_FILE) else ''
+        cur_eao=expose_active_only()
         model_ids=get_model_ids()
         dm_opts=f'<option value="" {"selected" if not cur_dm else ""}>env default</option>'
         dm_opts+=''.join(f'<option value="{m}" {"selected" if cur_dm==m else ""}>{m}</option>' for m in model_ids)
         shash=script_hash()
         html=f'''<!DOCTYPE html><html><head><meta charset=utf-8><title>llama-swap</title>
-<style>body{{font-family:monospace;margin:1em}}textarea{{width:100%;height:60vh;font-family:monospace;font-size:12px}}select,button{{margin:2px;padding:4px 10px;font-family:monospace}}#st{{padding:6px;background:#eee;font-size:13px}}.strow{{margin-bottom:6px}}small{{color:#888}}</style></head>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>
+*{{box-sizing:border-box}}
+body{{font-family:monospace;margin:1em}}
+textarea{{width:100%;height:60vh;font-family:monospace;font-size:12px}}
+select,button{{margin:2px;padding:4px 10px;font-family:monospace}}
+input{{font-family:monospace}}
+#st{{padding:6px;background:#eee;font-size:13px;word-break:break-word}}
+.strow{{margin-bottom:6px}}
+small{{color:#888}}
+table{{width:100%;border-collapse:collapse;font-size:12px}}
+.bar{{display:flex;flex-wrap:wrap;align-items:center;gap:4px}}
+.bar label{{display:inline-flex;align-items:center;gap:4px}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:6px 12px;font-size:12px}}
+@media (max-width:720px){{
+  body{{margin:.5em;font-size:14px}}
+  h3,h4{{font-size:15px}}
+  /* 16px inputs keep iOS Safari from zooming in on focus; 40px rows stay tappable */
+  select,button,input{{font-size:16px;padding:8px 10px;min-height:40px}}
+  .bar{{flex-direction:column;align-items:stretch}}
+  .bar>*,.bar a,.bar a>button,.bar label,.bar label>select{{width:100%}}
+  .bar label{{flex-direction:column;align-items:flex-start;gap:2px}}
+  .bar label.chk{{flex-direction:row;align-items:center}}
+  .bar label.chk input{{min-height:0;width:auto}}
+  textarea{{height:40vh}}
+  .grid{{grid-template-columns:1fr}}
+  /* stack table rows into cards — the 3-column model editor is unusable at phone width */
+  #mtbl thead,#ctbl thead{{display:none}}
+  #mtbl tr,#ctbl tr{{display:block;border:1px solid #ccc;border-radius:4px;padding:6px;margin-bottom:8px}}
+  #mtbl td,#ctbl td{{display:block;width:100%;padding:2px 0}}
+  #mtbl td:before,#ctbl td:before{{content:attr(data-l);display:block;color:#888;font-size:11px}}
+  #mtbl td button,#ctbl td button{{width:100%}}
+  #termbox{{height:240px!important}}
+  #slog{{height:35vh!important}}
+}}
+</style></head>
 <body><h3>llama-swap config.yaml <small style="font-weight:normal">[scripts: {shash}]</small></h3>
 <div class=strow style="display:flex;align-items:flex-start;gap:4px"><div id=st style="flex:1">...</div><button onclick="navigator.clipboard.writeText(document.getElementById('st').textContent)" style="padding:2px 7px;font-size:11px;font-family:monospace;flex-shrink:0">copy</button></div>
+<div class=strow style="display:flex;align-items:center;gap:6px;flex-wrap:wrap"><span id=ctxinfo style="font-size:12px;color:#555">context: (no model loaded)</span><button id=ctxbtn onclick="copyCtx()" style="padding:2px 7px;font-size:11px;font-family:monospace">copy context length</button></div>
 <details id=cd style="margin:2px 0 4px"><summary style="cursor:pointer;user-select:none;font-size:12px;color:#555">&#9658; Active server command <button id=cpycmd onclick="event.preventDefault();var t=document.getElementById('cmdline').textContent;navigator.clipboard.writeText(t).then(function(){{var b=document.getElementById('cpycmd');b.textContent='copied!';setTimeout(function(){{b.textContent='copy';}},2000);}});" style="padding:1px 6px;font-size:11px;font-family:monospace">copy</button></summary><pre id=cmdline style="background:#111;color:#aaa;padding:6px;margin:2px 0;font-size:11px;white-space:pre-wrap;word-break:break-all">(no model loaded)</pre></details>
-<div>
+<div class=bar>
 <label>Default model: <select id=dm onchange="setDM(this.value)">{dm_opts}</select></label>
 <button onclick="doLoad()">Switch</button>
 <label>Downloader: <select id=dl onchange="setDL(this.value)">
@@ -391,22 +446,23 @@ class H(BaseHTTPRequestHandler):
 <button onclick="doUpdate()">Update Scripts</button>
 <a href="/ui" target="_blank"><button type=button>llama-swap UI</button></a>
 <a href="/editor/debug" target="_blank"><button type=button>Logs / Debug</button></a>
+<label class=chk title="Hide every other model from /v1/models so API clients only ever see the model that is loaded"><input type=checkbox id=eao {"checked" if cur_eao else ""} onchange="setEAO(this.checked)"> Expose only active model to /v1/models</label>
 <span id=msg style="font-size:12px;color:#888"></span>
 </div>
 <small>p1=max ctx single user | p2/p4=split ctx | p8=may OOM on single GPU</small><br>
 <h4 style="margin:10px 0 4px">Models</h4>
-<table id=mtbl style="width:100%;border-collapse:collapse;font-size:12px">
+<table id=mtbl>
 <thead><tr style="text-align:left"><th style="width:34%">Model URL</th><th style="width:33%">MMPROJ URL (optional)</th><th style="width:30%">Draft/MTP URL (optional)</th><th></th></tr></thead>
 <tbody id=mrows></tbody>
 </table>
 <button onclick="addRow()">+ Add model</button>
 <h4 style="margin:14px 0 4px">Cached model files <button onclick="doPurgeAll()" style="color:#a00">Purge all</button> <button onclick="loadCache()" style="font-size:11px">&#8635;</button></h4>
-<table id=ctbl style="width:100%;border-collapse:collapse;font-size:12px">
+<table id=ctbl>
 <thead><tr style="text-align:left"><th style="width:60%">File</th><th style="width:15%">Size</th><th style="width:15%">Status</th><th></th></tr></thead>
 <tbody id=crows><tr><td colspan=4><small>loading...</small></td></tr></tbody>
 </table>
 <h4 style="margin:14px 0 4px">Settings</h4>
-<div id=sgrid style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:6px 12px;font-size:12px">
+<div id=sgrid class=grid>
 <label>HF_TOKEN<br><input type=password id=s_HF_TOKEN style="width:100%;box-sizing:border-box"></label>
 <label>DOWNLOADER<br><select id=s_DOWNLOADER style="width:100%"><option value="">env default</option><option value="aria2c">aria2c</option><option value="hf">hf (Xet)</option></select></label>
 <label>HF_BACKEND<br><select id=s_HF_BACKEND style="width:100%"><option value="">env default</option><option value="hf_xet">hf_xet</option><option value="hf_transfer">hf_transfer</option></select></label>
@@ -421,7 +477,7 @@ class H(BaseHTTPRequestHandler):
 </div>
 <h4 style="margin:14px 0 4px">Embeddings <small style="font-weight:normal;color:#888">(always-on sidecar on :8090 &mdash; SillyTavern vector storage)</small></h4>
 <div id=estat style="padding:6px;background:#eee;font-size:12px;margin-bottom:4px">...</div>
-<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:6px 12px;font-size:12px">
+<div class=grid>
 <label style="grid-column:1/-1">Preset<br><select id=e_preset onchange="applyPreset(this.value)" style="width:100%"></select></label>
 <label style="grid-column:1/-1">EMBED_MODEL_URL<br><input id=s_EMBED_MODEL_URL style="width:100%;box-sizing:border-box" placeholder="(blank = embeddings disabled)"></label>
 <label>EMBED_POOLING<br><select id=s_EMBED_POOLING style="width:100%"><option value="">auto (from GGUF)</option><option value="none">none</option><option value="mean">mean</option><option value="cls">cls</option><option value="last">last</option></select></label>
@@ -448,6 +504,18 @@ var M=document.getElementById('msg'),E='/editor',lastSaveTs=0,slPaused=false;
 function setDM(v){{fetch(E+'/default_model',{{method:'POST',body:v}}).then(()=>M.textContent='✓ default model set')}}
 function doLoad(){{var v=document.getElementById('dm').value;if(!v){{M.textContent='select a model first';return;}}M.textContent='switching...';fetch(E+'/load',{{method:'POST',body:v}}).then(r=>M.textContent=r.ok?'✓ loading '+v:'✗ '+r.status)}}
 function setDL(v){{fetch(E+'/downloader',{{method:'POST',body:v}}).then(()=>M.textContent='✓ downloader set')}}
+function setEAO(v){{fetch(E+'/expose_active_only',{{method:'POST',body:v?'1':'0'}}).then(r=>M.textContent=r.ok?(v?'✓ /v1/models now lists only the active model':'✓ /v1/models lists all models'):'✗ '+r.status)}}
+var ctxState={{per:0,total:0,train:0,par:1}};
+function copyCtx(){{
+  var n=ctxState.per||ctxState.total;
+  var b=document.getElementById('ctxbtn');
+  if(!n){{b.textContent='no model loaded';setTimeout(function(){{b.textContent='copy context length';}},2000);return;}}
+  navigator.clipboard.writeText(String(n)).then(function(){{
+    b.textContent='copied '+n+'!';setTimeout(function(){{b.textContent='copy context length';}},2000);
+  }}).catch(function(){{
+    b.textContent='copy failed';setTimeout(function(){{b.textContent='copy context length';}},2000);
+  }});
+}}
 function setCT(v){{M.textContent='applying...';fetch(E+'/cache_type',{{method:'POST',body:v}}).then(r=>M.textContent=r.ok?'✓ kv cache quant set (unloaded — reload to apply)':'✗ '+r.status)}}
 function doUnload(){{fetch(E+'/unload',{{method:'POST'}}).then(()=>M.textContent='✓ unloaded')}}
 function doRegen(){{M.textContent='regenerating...';fetch(E+'/regen',{{method:'POST'}}).then(r=>r.text()).then(t=>{{document.getElementById('cfg').value=t;M.textContent='✓ config regenerated — save to apply';}}).catch(e=>M.textContent='✗ '+e)}}
@@ -460,9 +528,9 @@ document.getElementById('s_CACHE_TYPE_K').innerHTML=cacheOptsHtml('');
 document.getElementById('s_CACHE_TYPE_V').innerHTML=cacheOptsHtml('');
 function rowHtml(m){{
   m=m||{{}};
-  return '<tr><td><input type=text class=murl value="'+esc(m.model_url)+'" style="width:100%;box-sizing:border-box" placeholder="https://huggingface.co/.../model.gguf"></td>'+
-  '<td><input type=text class=mmurl value="'+esc(m.mmproj_url)+'" style="width:100%;box-sizing:border-box" placeholder="(optional)"></td>'+
-  '<td><input type=text class=dmurl value="'+esc(m.draft_model_url)+'" style="width:100%;box-sizing:border-box" placeholder="(optional)"></td>'+
+  return '<tr><td data-l="Model URL"><input type=text class=murl value="'+esc(m.model_url)+'" style="width:100%;box-sizing:border-box" placeholder="https://huggingface.co/.../model.gguf"></td>'+
+  '<td data-l="MMPROJ URL (optional)"><input type=text class=mmurl value="'+esc(m.mmproj_url)+'" style="width:100%;box-sizing:border-box" placeholder="(optional)"></td>'+
+  '<td data-l="Draft/MTP URL (optional)"><input type=text class=dmurl value="'+esc(m.draft_model_url)+'" style="width:100%;box-sizing:border-box" placeholder="(optional)"></td>'+
   '<td><button onclick="this.closest(\\'tr\\').remove()" style="padding:2px 8px">&times;</button></td></tr>';
 }}
 function addRow(m){{document.getElementById('mrows').insertAdjacentHTML('beforeend',rowHtml(m));}}
@@ -572,7 +640,7 @@ function loadCache(){{
     var tb=document.getElementById('crows');
     if(!files.length){{tb.innerHTML='<tr><td colspan=4><small>(no cached files)</small></td></tr>';return;}}
     tb.innerHTML=files.map(function(f){{
-      return '<tr><td style="word-break:break-all">'+esc(f.name)+'</td><td>'+fmtSize(f.size)+'</td><td>'+(f.active?'in use':'')+'</td>'+
+      return '<tr><td data-l="File" style="word-break:break-all">'+esc(f.name)+'</td><td data-l="Size">'+fmtSize(f.size)+'</td><td data-l="Status">'+(f.active?'in use':'')+'</td>'+
       '<td><button onclick="doPurgeOne('+esc(JSON.stringify(f.name))+')" style="padding:2px 8px">&times;</button></td></tr>';
     }}).join('');
   }}).catch(()=>{{document.getElementById('crows').innerHTML='<tr><td colspan=4><small>error loading cache</small></td></tr>';}});
@@ -607,6 +675,11 @@ function poll(){{
     txt+=age(s.ts);
     el.style.background={{'error':'#fee','ready':'#dfd','downloading':'#e8f0fe','loading':'#e8f0fe','retrying':'#fff3cd'}}[st]||'#eee';
     el.textContent=txt;
+    ctxState={{per:s.n_ctx_per_slot||0,total:s.ctx||0,train:s.n_ctx_train||0,par:s.par||1}};
+    var ci=document.getElementById('ctxinfo');
+    if(ci)ci.textContent=ctxState.per
+      ?('context: '+ctxState.per+' tokens per slot ('+ctxState.total+' total across '+ctxState.par+' slot'+(ctxState.par>1?'s':'')+(ctxState.train?', model trained for '+ctxState.train:'')+')')
+      :'context: (no model loaded)';
     var cp=document.getElementById('cmdline');
     if(cp)cp.textContent=s.cmd||(st==='idle'?'(no model loaded)':'...');
     var logModel=m||(s.model||'');
@@ -667,7 +740,7 @@ function initTerm(){{
       term.onResize(function(s){{if(ws.readyState===1)ws.send(JSON.stringify({{type:'resize',cols:s.cols,rows:s.rows}}));}});
       window.addEventListener('resize',function(){{fit.fit();}});
     }}
-  }}catch(err){{div.innerHTML='<pre style="color:#f00;padding:8px">Terminal init error: '+err+'</pre>';}}
+  }}catch(err){{div.innerHTML='<pre style="color:#f00;padding:8px;white-space:pre-wrap;word-break:break-all">Terminal init error: '+err+'</pre>';}}
 }}
 </script></body></html>'''
         self.ok(html.encode(),'text/html')
@@ -678,9 +751,11 @@ function initTerm(){{
         found=sorted(glob.glob('/tmp/*.log'))
         opts=''.join(f'<option value="{os.path.basename(p)}">{known.get(p,os.path.basename(p))}</option>' for p in found)
         html=f'''<!DOCTYPE html><html><head><meta charset=utf-8><title>debug</title>
-<style>body{{font-family:monospace;margin:1em;font-size:12px}}
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>*{{box-sizing:border-box}}body{{font-family:monospace;margin:1em;font-size:12px}}
 pre{{background:#111;color:#0f0;padding:8px;height:38vh;overflow-y:auto;white-space:pre-wrap;word-break:break-all}}
-button{{margin:2px;padding:3px 8px}}h3{{margin:6px 0}}</style></head><body>
+button{{margin:2px;padding:3px 8px}}h3{{margin:6px 0}}
+@media (max-width:720px){{body{{margin:.5em;font-size:14px}}select,button{{font-size:16px;padding:8px 10px;min-height:40px}}select{{max-width:100%}}h3{{display:flex;flex-wrap:wrap;align-items:center;gap:4px}}pre{{height:30vh}}}}</style></head><body>
 <h3>Processes <button onclick="loadPS()">↻</button></h3><pre id=ps>loading...</pre>
 <h3>Log: <select id=lg onchange="loadLog()">{opts}</select>
 <button onclick="loadLog()">↻</button>
