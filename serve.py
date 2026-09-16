@@ -1,4 +1,4 @@
-import os,sys,struct,math,shutil,subprocess as sp,urllib.request,json,time
+import os,sys,struct,math,shutil,subprocess as sp,urllib.request,json,time,threading
 PORT=sys.argv[1]
 MODEL_URL=os.environ['MODEL_URL']
 MMPROJ_URL=os.environ.get('MMPROJ_URL','')
@@ -13,13 +13,64 @@ if os.path.isfile(_dl_override):
 # aria2c exit codes where retrying is pointless
 _FATAL_ARIA2C_CODES=frozenset({3,9,17,18,25})  # 404, disk full, bad auth, file open, no-resume
 DOWNLOAD_MAX_ATTEMPTS=int(os.environ.get('DOWNLOAD_MAX_ATTEMPTS','10'))
+
+def _int_setting(name,default,lo,hi,override_file=None):
+    """Download tuning knob: /app/<file> (written by the editor UI) wins over the
+    env var, same precedence as DOWNLOADER and CACHE_TYPE_K/V."""
+    raw=''
+    if override_file and os.path.isfile(override_file):
+        try: raw=open(override_file).read().strip()
+        except OSError: raw=''
+    raw=raw or os.environ.get(name,'').strip()
+    try: v=int(raw) if raw else default
+    except ValueError: v=default
+    return max(lo,min(hi,v))
+
+# connections aria2c opens per file (-x/-s), and how many files are fetched at
+# once when a model brings an mmproj and/or a draft model along.
+DOWNLOAD_CONNECTIONS=_int_setting('DOWNLOAD_CONNECTIONS',16,1,16,'/app/download_connections')
+DOWNLOAD_PARALLEL=_int_setting('DOWNLOAD_PARALLEL',1,1,8,'/app/download_parallel')
 MODEL_DIR='/models'
 STATUS='/tmp/serve_status.json'
 os.makedirs(MODEL_DIR,exist_ok=True)
 
+# ---------------------------------------------------------------- status file
+# The editor UI polls /tmp/serve_status.json. Alongside the single overall
+# status it now carries a 'downloads' list — one entry per file with percent,
+# speed and ETA — so the UI can draw a progress bar per download.
+_status_lock=threading.RLock()
+_status_base={'status':'idle'}
+_dl_state={}
+
+def _status_doc():
+    d=dict(_status_base)
+    if _dl_state:
+        dls=[dict(_dl_state[k]) for k in sorted(_dl_state)]
+        d['downloads']=dls
+        total=sum(x.get('size_mb') or 0 for x in dls)
+        done=sum(x.get('done_mb') or 0 for x in dls)
+        if total: d.setdefault('pct',round(min(100.0,done*100.0/total),1))
+        speed=sum(x.get('speed_mbps') or 0 for x in dls if x.get('status')=='downloading')
+        if speed: d['speed_mbps']=round(speed,1)
+    return d
+
+def _flush_status():
+    try: open(STATUS,'w').write(json.dumps(_status_doc()))
+    except Exception: pass
+
 def write_status(d):
-    try: open(STATUS,'w').write(json.dumps(d))
-    except: pass
+    """Set the overall status. Per-file download entries are dropped once the
+    model reaches the server, so finished bars don't linger in the UI."""
+    global _status_base
+    with _status_lock:
+        _status_base=dict(d)
+        if d.get('status') in ('loading','ready','idle'): _dl_state.clear()
+        _flush_status()
+
+def set_progress(key,**kw):
+    with _status_lock:
+        _dl_state.setdefault(key,{'name':key}).update(kw)
+        _flush_status()
 
 def _try_remove(*paths):
     for p in paths:
@@ -36,30 +87,123 @@ def remote_size(url):
             return int(cl) if cl else None
     except: return None
 
+# ------------------------------------------------------------ download progress
+_incomplete_owner={}
+
+def _hf_partial_bytes(key,t0):
+    """Bytes huggingface_hub has written so far. It fills a *.incomplete file
+    under /models/.cache before moving it into place, so the destination path
+    stays empty until the very end. Each .incomplete file is claimed by the
+    first download that sees it, which keeps parallel downloads from counting
+    each other's bytes."""
+    total=0
+    for root,_,files in os.walk(os.path.join(MODEL_DIR,'.cache')):
+        for f in files:
+            if not f.endswith('.incomplete'): continue
+            p=os.path.join(root,f)
+            owner=_incomplete_owner.get(p)
+            if owner is None:
+                try:
+                    if os.path.getmtime(p)<t0-5: continue  # leftover from an earlier run
+                except OSError: continue
+                _incomplete_owner[p]=owner=key
+            if owner!=key: continue
+            try: total+=os.path.getsize(p)
+            except OSError: pass
+    return total
+
+class Progress:
+    """Samples the growing file on disk and publishes percent/speed/ETA.
+
+    Polling the file is downloader-agnostic: aria2c writes straight to the
+    destination, huggingface_hub to a .incomplete file, and both are covered
+    without parsing either tool's console output."""
+    def __init__(self,key,dest,size_bytes):
+        self.key=key; self.dest=dest; self.size=size_bytes or 0
+        self._stop=threading.Event(); self._thread=None
+        self._t0=time.time(); self._last=(self._t0,self._bytes()); self._speed=0.0
+
+    def _bytes(self):
+        try:
+            if os.path.isfile(self.dest): return os.path.getsize(self.dest)
+        except OSError: pass
+        return _hf_partial_bytes(self.key,self._t0)
+
+    def sample(self):
+        now=time.time(); done=self._bytes()
+        pt,pd=self._last
+        dt=now-pt
+        if dt>=1:
+            inst=max(0.0,(done-pd))/dt/1048576
+            # smooth so a bursty connection doesn't make the ETA jump around
+            self._speed=inst if self._speed==0 else self._speed*0.6+inst*0.4
+            self._last=(now,done)
+        pct=round(min(100.0,done*100.0/self.size),1) if self.size else None
+        eta=None
+        if self.size and self._speed>0.05 and done<self.size:
+            eta=int((self.size-done)/(self._speed*1048576))
+        set_progress(self.key,done_mb=done//1048576,size_mb=self.size//1048576,
+                     pct=pct,speed_mbps=round(self._speed,1),eta_s=eta,
+                     elapsed_s=int(now-self._t0))
+
+    def _run(self):
+        while not self._stop.wait(2):
+            try: self.sample()
+            except Exception: pass
+
+    def start(self):
+        self._thread=threading.Thread(target=self._run,daemon=True); self._thread.start()
+        return self
+
+    def stop(self,status=None):
+        self._stop.set()
+        if self._thread: self._thread.join(timeout=3)
+        try: self.sample()
+        except Exception: pass
+        if status:
+            done=self._bytes()
+            set_progress(self.key,status=status,speed_mbps=0,eta_s=None,
+                         pct=100.0 if status=='done' else None if not self.size else round(min(100.0,done*100.0/self.size),1))
+
 def _is_active(fp):
     try:
         pid=int(open(fp+'.pid').read())
         return os.path.exists(f'/proc/{pid}')
     except: return False
 
+# Disk accounting is shared: with parallel downloads several threads may need to
+# evict at once, and each must see what the others still have left to write.
+_space_lock=threading.Lock()
+_reserved={}
+
+def _outstanding():
+    total=0
+    for dest,size in _reserved.items():
+        try: have=os.path.getsize(dest) if os.path.isfile(dest) else 0
+        except OSError: have=0
+        total+=max(0,size-have)
+    return total
+
 def ensure_space(needed_bytes,keep):
-    free=shutil.disk_usage(MODEL_DIR).free
-    print(f'[serve] disk: {free//1048576}MB free, need {needed_bytes//1048576}MB',flush=True)
-    if free>=needed_bytes*1.1: return
-    print(f'[serve] insufficient space — evicting old models',flush=True)
-    for allow_active in (False,True):
-        for f in sorted(os.listdir(MODEL_DIR)):
-            fp=os.path.join(MODEL_DIR,f)
-            if fp in keep or not os.path.isfile(fp) or not f.endswith('.gguf'): continue
-            if not allow_active and _is_active(fp): continue
-            sz=os.path.getsize(fp)
-            os.remove(fp)
-            try: os.remove(fp+'.pid')
-            except: pass
-            print(f'[serve] evicted {f} ({sz//1048576}MB, was_active={allow_active})',flush=True)
+    with _space_lock:
+        needed_bytes=max(needed_bytes,_outstanding())
+        free=shutil.disk_usage(MODEL_DIR).free
+        print(f'[serve] disk: {free//1048576}MB free, need {needed_bytes//1048576}MB',flush=True)
+        if free>=needed_bytes*1.1: return
+        print(f'[serve] insufficient space — evicting old models',flush=True)
+        for allow_active in (False,True):
+            for f in sorted(os.listdir(MODEL_DIR)):
+                fp=os.path.join(MODEL_DIR,f)
+                if fp in keep or not os.path.isfile(fp) or not f.endswith('.gguf'): continue
+                if not allow_active and _is_active(fp): continue
+                sz=os.path.getsize(fp)
+                os.remove(fp)
+                try: os.remove(fp+'.pid')
+                except: pass
+                print(f'[serve] evicted {f} ({sz//1048576}MB, was_active={allow_active})',flush=True)
+                if shutil.disk_usage(MODEL_DIR).free>=needed_bytes*1.1: break
             if shutil.disk_usage(MODEL_DIR).free>=needed_bytes*1.1: break
-        if shutil.disk_usage(MODEL_DIR).free>=needed_bytes*1.1: break
-    print(f'[serve] disk after eviction: {shutil.disk_usage(MODEL_DIR).free//1048576}MB free',flush=True)
+        print(f'[serve] disk after eviction: {shutil.disk_usage(MODEL_DIR).free//1048576}MB free',flush=True)
 
 def dl(url,keep):
     import hashlib
@@ -67,6 +211,8 @@ def dl(url,keep):
     dest=f'{MODEL_DIR}/{hashlib.md5(url.encode()).hexdigest()[:8]}_{name}'
     if os.path.isfile(dest):
         print(f'[serve] cached: {name}',flush=True)
+        sz_mb=os.path.getsize(dest)//1048576
+        set_progress(name,status='cached',pct=100.0,done_mb=sz_mb,size_mb=sz_mb)
         write_status({'status':'cached','model':name,'ts':int(time.time())})
         return dest
     # Wait for a concurrent download of the same file (aria2 sidecar only, not .cache dir)
@@ -78,16 +224,23 @@ def dl(url,keep):
         time.sleep(5)
     if os.path.isfile(dest):
         print(f'[serve] appeared after wait: {name}',flush=True)
+        sz_mb=os.path.getsize(dest)//1048576
+        set_progress(name,status='cached',pct=100.0,done_mb=sz_mb,size_mb=sz_mb)
         write_status({'status':'cached','model':name,'ts':int(time.time())})
         return dest
     sz=remote_size(url)
     sz_mb=sz//1048576 if sz else 0
-    if sz: ensure_space(sz,keep)
+    if sz:
+        _reserved[dest]=sz
+        ensure_space(sz,keep)
     else: print(f'[serve] could not determine remote size for {name}, proceeding',flush=True)
-    print(f'[serve] downloading: {name} ({sz_mb}MB) via {DOWNLOADER}',flush=True)
+    print(f'[serve] downloading: {name} ({sz_mb}MB) via {DOWNLOADER} x{DOWNLOAD_CONNECTIONS}',flush=True)
+    set_progress(name,status='downloading',size_mb=sz_mb,done_mb=0,
+                 pct=0.0 if sz else None,speed_mbps=0,eta_s=None,
+                 attempt=1,max_attempts=DOWNLOAD_MAX_ATTEMPTS)
     write_status({'status':'downloading','model':name,'size_mb':sz_mb,'ts':int(time.time())})
 
-    import pty,select,errno,threading
+    import pty,select,errno
 
     class StallError(Exception): pass
 
@@ -101,7 +254,7 @@ def dl(url,keep):
             while proc.poll() is None:
                 time.sleep(5)
                 if time.time()-last_output[0]>stall_timeout:
-                    print(f'[dl] stalled for {stall_timeout}s — killing',flush=True)
+                    print(f'[dl {name}] stalled for {stall_timeout}s — killing',flush=True)
                     proc.kill()
                     return
         wt=threading.Thread(target=watchdog,daemon=True); wt.start()
@@ -109,7 +262,7 @@ def dl(url,keep):
         def maybe_heartbeat():
             if time.time()-last_output[0]>60:
                 elapsed=int(time.time()-t_start)
-                print(f'[dl] ... still downloading ({elapsed}s elapsed)',flush=True)
+                print(f'[dl {name}] ... still downloading ({elapsed}s elapsed)',flush=True)
                 last_output[0]=time.time()
 
         while True:
@@ -125,7 +278,7 @@ def dl(url,keep):
                                     line,buf=buf.split(sep,1)
                                     text=line.decode('utf-8','replace').strip()
                                     if text:
-                                        print(f'[dl] {text}',flush=True)
+                                        print(f'[dl {name}] {text}',flush=True)
                                         last_output[0]=time.time()
                                     break
                 else:
@@ -144,89 +297,100 @@ def dl(url,keep):
         os.close(out_r)
         rc=proc.wait()
         wt.join(timeout=1)
-        if buf.strip(): print(f'[dl] {buf.decode("utf-8","replace").strip()}',flush=True)
+        if buf.strip(): print(f'[dl {name}] {buf.decode("utf-8","replace").strip()}',flush=True)
         if rc<0: raise StallError(f'download stalled after {stall_timeout}s of silence')
         if rc!=0:
             safe=[c if not c.startswith('--header=Authorization') else '--header=Authorization: Bearer [REDACTED]' for c in cmd]
             raise sp.CalledProcessError(rc,safe)
 
+    prog=Progress(name,dest,sz).start()
     delay=30; last_exc=None
-    for attempt in range(1,DOWNLOAD_MAX_ATTEMPTS+1):
-        if attempt>1:
-            print(f'[serve] attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS}: {name}',flush=True)
-            write_status({'status':'downloading','model':name,'size_mb':sz_mb,
-                          'attempt':attempt,'ts':int(time.time())})
-        try:
-            if DOWNLOADER=='hf':
-                rem=url.removeprefix('https://huggingface.co/')
-                parts=rem.split('/'); repo='/'.join(parts[:2]); rev=parts[3]; fname='/'.join(parts[4:])
-                if HF_BACKEND=='hf_transfer':
-                    os.environ['HF_HUB_ENABLE_HF_TRANSFER']='1'
-                else:
-                    os.environ['HF_XET_HIGH_PERFORMANCE']='1'
-                print(f'[serve] hf_hub_download {repo} {fname}',flush=True)
-                try: from huggingface_hub import hf_hub_download as _hfdl
-                except ImportError:
-                    sp.run(['pip','install','-q','huggingface_hub','--break-system-packages'],check=True)
-                    from huggingface_hub import hf_hub_download as _hfdl
-                out=_hfdl(repo_id=repo,filename=fname,revision=rev,local_dir=MODEL_DIR,token=HF_TOKEN or None)
-                if out and out!=dest and os.path.isfile(out) and not os.path.isfile(dest):
-                    os.rename(out,dest)
-            else:
-                cmd=['aria2c','-x16','-s16','-k10M','--file-allocation=none',
-                     '--summary-interval=30','--show-console-readout=false',
-                     '-d',MODEL_DIR,'-o',os.path.basename(dest),url]
-                if HF_TOKEN: cmd+=[f'--header=Authorization: Bearer {HF_TOKEN}']
-                run_streaming(cmd)
-            last_exc=None; break  # success
-
-        except StallError as e:
-            last_exc=e
-            if attempt>=DOWNLOAD_MAX_ATTEMPTS:
-                _try_remove(dest,f'{dest}.aria2'); break
-            if attempt==DOWNLOAD_MAX_ATTEMPTS-1:
-                # penultimate attempt: clear control file so next is a fresh start
-                _try_remove(f'{dest}.aria2')
-                print(f'[serve] STALL attempt {attempt}: cleared control file, fresh start next',flush=True)
-            else:
-                print(f'[serve] STALL attempt {attempt}: resuming in {delay}s',flush=True)
-            write_status({'status':'retrying','model':name,'attempt':attempt,
-                          'max_attempts':DOWNLOAD_MAX_ATTEMPTS,'reason':'stall',
-                          'retry_in':delay,'ts':int(time.time())})
-            time.sleep(delay); delay=min(delay*2,300)
-
-        except sp.CalledProcessError as e:
-            last_exc=e; rc=e.returncode
-            if DOWNLOADER=='hf' or attempt>=DOWNLOAD_MAX_ATTEMPTS:
-                _try_remove(dest,f'{dest}.aria2'); break
-            if rc in _FATAL_ARIA2C_CODES:
-                # aria2c can't reach the file (404/auth/etc) — try hf CLI as fallback
-                print(f'[serve] aria2c fatal rc={rc} for {name}, trying hf fallback',flush=True)
-                _try_remove(dest,f'{dest}.aria2')
-                try:
+    try:
+        for attempt in range(1,DOWNLOAD_MAX_ATTEMPTS+1):
+            if attempt>1:
+                print(f'[serve] attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS}: {name}',flush=True)
+                set_progress(name,status='downloading',attempt=attempt,max_attempts=DOWNLOAD_MAX_ATTEMPTS)
+                write_status({'status':'downloading','model':name,'size_mb':sz_mb,
+                              'attempt':attempt,'ts':int(time.time())})
+            try:
+                if DOWNLOADER=='hf':
                     rem=url.removeprefix('https://huggingface.co/')
-                    hf_parts=rem.split('/'); hf_repo='/'.join(hf_parts[:2]); hf_rev=hf_parts[3]; hf_fname='/'.join(hf_parts[4:])
-                    os.environ['HF_XET_HIGH_PERFORMANCE']='1'
-                    print(f'[serve] hf_hub_download fallback {hf_repo} {hf_fname}',flush=True)
+                    parts=rem.split('/'); repo='/'.join(parts[:2]); rev=parts[3]; fname='/'.join(parts[4:])
+                    if HF_BACKEND=='hf_transfer':
+                        os.environ['HF_HUB_ENABLE_HF_TRANSFER']='1'
+                    else:
+                        os.environ['HF_XET_HIGH_PERFORMANCE']='1'
+                    print(f'[serve] hf_hub_download {repo} {fname}',flush=True)
                     try: from huggingface_hub import hf_hub_download as _hfdl
                     except ImportError:
                         sp.run(['pip','install','-q','huggingface_hub','--break-system-packages'],check=True)
                         from huggingface_hub import hf_hub_download as _hfdl
-                    out=_hfdl(repo_id=hf_repo,filename=hf_fname,revision=hf_rev,local_dir=MODEL_DIR,token=HF_TOKEN or None)
+                    out=_hfdl(repo_id=repo,filename=fname,revision=rev,local_dir=MODEL_DIR,token=HF_TOKEN or None)
                     if out and out!=dest and os.path.isfile(out) and not os.path.isfile(dest):
                         os.rename(out,dest)
-                    last_exc=None; break
-                except Exception as hf_e:
-                    print(f'[serve] hf fallback also failed: {hf_e}',flush=True)
-                    last_exc=hf_e; break
-            print(f'[serve] error attempt {attempt} (rc={rc}): retrying in {delay}s',flush=True)
-            write_status({'status':'retrying','model':name,'attempt':attempt,
-                          'max_attempts':DOWNLOAD_MAX_ATTEMPTS,'reason':f'exit {rc}',
-                          'retry_in':delay,'ts':int(time.time())})
-            time.sleep(delay); delay=min(delay*2,300)
+                else:
+                    cmd=['aria2c',f'-x{DOWNLOAD_CONNECTIONS}',f'-s{DOWNLOAD_CONNECTIONS}',
+                         '-k10M','--file-allocation=none',
+                         '--summary-interval=30','--show-console-readout=false',
+                         '-d',MODEL_DIR,'-o',os.path.basename(dest),url]
+                    if HF_TOKEN: cmd+=[f'--header=Authorization: Bearer {HF_TOKEN}']
+                    run_streaming(cmd)
+                last_exc=None; break  # success
 
-        except Exception as e:
-            last_exc=e; _try_remove(dest,f'{dest}.aria2'); break  # unexpected — don't retry
+            except StallError as e:
+                last_exc=e
+                if attempt>=DOWNLOAD_MAX_ATTEMPTS:
+                    _try_remove(dest,f'{dest}.aria2'); break
+                if attempt==DOWNLOAD_MAX_ATTEMPTS-1:
+                    # penultimate attempt: clear control file so next is a fresh start
+                    _try_remove(f'{dest}.aria2')
+                    print(f'[serve] STALL attempt {attempt}: cleared control file, fresh start next',flush=True)
+                else:
+                    print(f'[serve] STALL attempt {attempt}: resuming in {delay}s',flush=True)
+                set_progress(name,status='retrying',attempt=attempt,max_attempts=DOWNLOAD_MAX_ATTEMPTS,
+                             reason='stall',retry_in=delay,speed_mbps=0,eta_s=None)
+                write_status({'status':'retrying','model':name,'attempt':attempt,
+                              'max_attempts':DOWNLOAD_MAX_ATTEMPTS,'reason':'stall',
+                              'retry_in':delay,'ts':int(time.time())})
+                time.sleep(delay); delay=min(delay*2,300)
+
+            except sp.CalledProcessError as e:
+                last_exc=e; rc=e.returncode
+                if DOWNLOADER=='hf' or attempt>=DOWNLOAD_MAX_ATTEMPTS:
+                    _try_remove(dest,f'{dest}.aria2'); break
+                if rc in _FATAL_ARIA2C_CODES:
+                    # aria2c can't reach the file (404/auth/etc) — try hf CLI as fallback
+                    print(f'[serve] aria2c fatal rc={rc} for {name}, trying hf fallback',flush=True)
+                    _try_remove(dest,f'{dest}.aria2')
+                    try:
+                        rem=url.removeprefix('https://huggingface.co/')
+                        hf_parts=rem.split('/'); hf_repo='/'.join(hf_parts[:2]); hf_rev=hf_parts[3]; hf_fname='/'.join(hf_parts[4:])
+                        os.environ['HF_XET_HIGH_PERFORMANCE']='1'
+                        print(f'[serve] hf_hub_download fallback {hf_repo} {hf_fname}',flush=True)
+                        try: from huggingface_hub import hf_hub_download as _hfdl
+                        except ImportError:
+                            sp.run(['pip','install','-q','huggingface_hub','--break-system-packages'],check=True)
+                            from huggingface_hub import hf_hub_download as _hfdl
+                        out=_hfdl(repo_id=hf_repo,filename=hf_fname,revision=hf_rev,local_dir=MODEL_DIR,token=HF_TOKEN or None)
+                        if out and out!=dest and os.path.isfile(out) and not os.path.isfile(dest):
+                            os.rename(out,dest)
+                        last_exc=None; break
+                    except Exception as hf_e:
+                        print(f'[serve] hf fallback also failed: {hf_e}',flush=True)
+                        last_exc=hf_e; break
+                print(f'[serve] error attempt {attempt} (rc={rc}): retrying in {delay}s',flush=True)
+                set_progress(name,status='retrying',attempt=attempt,max_attempts=DOWNLOAD_MAX_ATTEMPTS,
+                             reason=f'exit {rc}',retry_in=delay,speed_mbps=0,eta_s=None)
+                write_status({'status':'retrying','model':name,'attempt':attempt,
+                              'max_attempts':DOWNLOAD_MAX_ATTEMPTS,'reason':f'exit {rc}',
+                              'retry_in':delay,'ts':int(time.time())})
+                time.sleep(delay); delay=min(delay*2,300)
+
+            except Exception as e:
+                last_exc=e; _try_remove(dest,f'{dest}.aria2'); break  # unexpected — don't retry
+    finally:
+        prog.stop('error' if last_exc is not None else 'done')
+        _reserved.pop(dest,None)
 
     if last_exc is not None:
         print(f'[serve] ERROR downloading {name}: {last_exc}',flush=True)
@@ -234,18 +398,36 @@ def dl(url,keep):
         raise last_exc
     final_mb=os.path.getsize(dest)//1048576 if os.path.isfile(dest) else sz_mb
     print(f'[serve] downloaded: {name} ({final_mb}MB)',flush=True)
+    set_progress(name,status='done',pct=100.0,done_mb=final_mb,size_mb=final_mb)
     write_status({'status':'downloaded','model':name,'size_mb':final_mb,'ts':int(time.time())})
     return dest
 
+def dl_all(urls,keep):
+    """Fetch every URL, up to DOWNLOAD_PARALLEL at a time. A model with an
+    mmproj and a draft model is three separate files; on a fast link fetching
+    them together is markedly quicker than one after another."""
+    urls=[u for u in urls if u and u!='null']
+    if not urls: return {}
+    if DOWNLOAD_PARALLEL<=1 or len(urls)==1:
+        return {u:dl(u,keep) for u in urls}
+    from concurrent.futures import ThreadPoolExecutor
+    workers=min(DOWNLOAD_PARALLEL,len(urls))
+    print(f'[serve] downloading {len(urls)} files, {workers} at a time',flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures=[(u,ex.submit(dl,u,keep)) for u in urls]
+        return {u:f.result() for u,f in futures}  # first failure propagates
+
 import hashlib as _hl
 keep={f'{MODEL_DIR}/{_hl.md5(u.encode()).hexdigest()[:8]}_{u.split("/")[-1]}' for u in [MODEL_URL,MMPROJ_URL,DRAFT_MODEL_URL] if u and u!='null'}
-mp=dl(MODEL_URL,keep)
-mmp=''
-if MMPROJ_URL and MMPROJ_URL not in ('','null'):
-    mmp=dl(MMPROJ_URL,keep)
-dmp=''
+_want=[MODEL_URL]
+if MMPROJ_URL and MMPROJ_URL not in ('','null'): _want.append(MMPROJ_URL)
 if DRAFT_MODEL_URL and DRAFT_MODEL_URL not in ('','null') and os.environ.get('NO_MTP','0')!='1':
-    dmp=dl(DRAFT_MODEL_URL,keep)
+    _want.append(DRAFT_MODEL_URL)
+_paths=dl_all(_want,keep)
+mp=_paths[MODEL_URL]
+mmp=_paths.get(MMPROJ_URL,'') if MMPROJ_URL in _want else ''
+dmp=_paths.get(DRAFT_MODEL_URL,'') if DRAFT_MODEL_URL in _want else ''
+
 
 def _detect_vrams(retries=5,delay=3):
     best=[];prev=None

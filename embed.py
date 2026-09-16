@@ -8,7 +8,7 @@ guard on :8081) and embeddings (this process), concurrently.
 Config comes from /app/params.json (cfgedit UI) with a fallback to the
 container env vars, so EMBED_MODEL_URL keeps working as before.
 """
-import os,sys,json,time,shutil,signal,hashlib,subprocess as sp,urllib.request
+import os,sys,json,time,shutil,signal,hashlib,threading,subprocess as sp,urllib.request
 
 sys.path.insert(0,'/tmp')
 try:
@@ -25,6 +25,18 @@ DOWNLOAD_MAX_ATTEMPTS=int(os.environ.get('DOWNLOAD_MAX_ATTEMPTS','5'))
 _FATAL_ARIA2C_CODES=frozenset({3,9,17,18,25})
 
 def log(*a): print('[embed]',*a,flush=True)
+
+def dl_connections():
+    """aria2c connections per file, shared with serve.py's DOWNLOAD_CONNECTIONS
+    setting (params.json first, then the env var)."""
+    raw=''
+    if cfginit is not None:
+        try: raw=((cfginit.load_params().get('settings') or {}).get('DOWNLOAD_CONNECTIONS') or '').strip()
+        except Exception: raw=''
+    raw=raw or os.environ.get('DOWNLOAD_CONNECTIONS','').strip()
+    try: n=int(raw) if raw else 16
+    except ValueError: n=16
+    return max(1,min(16,n))
 
 def write_status(d):
     try: open(STATUS,'w').write(json.dumps(d))
@@ -67,6 +79,39 @@ def _hf_download(url,dest,token):
     if out and out!=dest and os.path.isfile(out) and not os.path.isfile(dest):
         os.rename(out,dest)
 
+def remote_size(url,token):
+    try:
+        req=urllib.request.Request(url,method='HEAD')
+        if token: req.add_header('Authorization',f'Bearer {token}')
+        with urllib.request.urlopen(req,timeout=15) as r:
+            cl=r.headers.get('Content-Length')
+            return int(cl) if cl else 0
+    except Exception: return 0
+
+def progress_reporter(dest,size,base):
+    """Publish percent/speed/ETA into the status file while aria2c writes, so
+    the editor UI can draw a progress bar for the embedding model too."""
+    stop=threading.Event()
+    def run():
+        t0=time.time(); last=(t0,0.0); speed=0.0
+        while not stop.wait(2):
+            try: done=os.path.getsize(dest) if os.path.isfile(dest) else 0
+            except OSError: done=0
+            now=time.time(); pt,pd=last
+            if now-pt>=1:
+                inst=max(0.0,done-pd)/(now-pt)/1048576
+                speed=inst if speed==0 else speed*0.6+inst*0.4
+                last=(now,done)
+            d=dict(base)
+            d.update({'done_mb':done//1048576,'size_mb':size//1048576,
+                      'speed_mbps':round(speed,1),'ts':int(time.time())})
+            if size:
+                d['pct']=round(min(100.0,done*100.0/size),1)
+                if speed>0.05 and done<size: d['eta_s']=int((size-done)/(speed*1048576))
+            write_status(d)
+    t=threading.Thread(target=run,daemon=True); t.start()
+    return stop,t
+
 def download(url):
     """Fetch the embedding model, reusing the shared /models cache.
 
@@ -81,13 +126,18 @@ def download(url):
         log(f'cached: {name}')
         return dest
     token=os.environ.get('HF_TOKEN','')
+    conns=dl_connections()
+    size=remote_size(url,token)
     delay=10
     for attempt in range(1,DOWNLOAD_MAX_ATTEMPTS+1):
-        write_status({'status':'downloading','model':name,'attempt':attempt,
-                      'max_attempts':DOWNLOAD_MAX_ATTEMPTS,'port':int(PORT),'ts':int(time.time())})
-        log(f'downloading {name} (attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS})')
+        base={'status':'downloading','model':name,'attempt':attempt,
+              'max_attempts':DOWNLOAD_MAX_ATTEMPTS,'port':int(PORT)}
+        write_status({**base,'size_mb':size//1048576,'done_mb':0,
+                      'pct':0.0 if size else None,'ts':int(time.time())})
+        log(f'downloading {name} (attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS}, x{conns})')
+        stop,thread=progress_reporter(dest,size,base)
         try:
-            cmd=['aria2c','-x16','-s16','-k10M','--file-allocation=none',
+            cmd=['aria2c',f'-x{conns}',f'-s{conns}','-k10M','--file-allocation=none',
                  '--summary-interval=30','--show-console-readout=false',
                  '-d',MODEL_DIR,'-o',os.path.basename(dest),url]
             if token: cmd+=[f'--header=Authorization: Bearer {token}']
@@ -105,6 +155,8 @@ def download(url):
             if attempt>=DOWNLOAD_MAX_ATTEMPTS:
                 _try_remove(dest,f'{dest}.aria2')
                 raise
+        finally:
+            stop.set(); thread.join(timeout=3)
         if attempt>=DOWNLOAD_MAX_ATTEMPTS: break
         time.sleep(delay); delay=min(delay*2,120)
     _try_remove(dest,f'{dest}.aria2')

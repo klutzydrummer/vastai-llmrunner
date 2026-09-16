@@ -9,6 +9,13 @@ MODEL_DIR='/models'
 DOWNLOADER_FILE='/app/downloader'
 DEFAULT_MODEL_FILE='/app/default_model'
 CACHE_TYPE_FILE='/app/cache_type'
+# Download tuning, applied by serve.py without a config regen (same override-file
+# pattern as /app/downloader): connections aria2c opens per file, and how many
+# files (model + mmproj + draft) are fetched at the same time.
+DL_CONNECTIONS_FILE='/app/download_connections'
+DL_PARALLEL_FILE='/app/download_parallel'
+DL_CONNECTIONS_DEFAULT=16
+DL_PARALLEL_DEFAULT=1
 # When set, guard.py trims /v1/models down to the active model only, so API
 # clients see a single entry instead of every variant in config.yaml.
 EXPOSE_ACTIVE_ONLY_FILE='/app/expose_active_only'
@@ -37,6 +44,18 @@ EMBED_PRESETS=[
 ]
 LOGS={'guard':'/tmp/guard.log','llama-swap':'/tmp/llama-swap.log',
       'caddy':'/tmp/caddy.log','cfgedit':'/tmp/cfgedit.log','cloudflared':'/tmp/cloudflared.log'}
+
+def read_override(path,default=''):
+    try:
+        v=open(path).read().strip()
+        return v or default
+    except OSError: return default
+
+def write_override(path,value):
+    v=(value or '').strip()
+    if v: open(path,'w').write(v)
+    elif os.path.exists(path): os.remove(path)
+    return v
 
 def script_hash():
     h=hashlib.sha256()
@@ -249,6 +268,9 @@ class H(BaseHTTPRequestHandler):
             self.ok(cur.encode())
         elif self.path=='/default_model':
             self.ok((open(DEFAULT_MODEL_FILE).read().strip() if os.path.exists(DEFAULT_MODEL_FILE) else '').encode())
+        elif self.path=='/download_opts':
+            self.ok(json.dumps({'connections':read_override(DL_CONNECTIONS_FILE),
+                                'parallel':read_override(DL_PARALLEL_FILE)}).encode(),'application/json')
         elif self.path=='/cache_type':
             cur=open(CACHE_TYPE_FILE).read().strip() if os.path.exists(CACHE_TYPE_FILE) else 'env default'
             self.ok(cur.encode())
@@ -308,6 +330,13 @@ class H(BaseHTTPRequestHandler):
             if v: open(EXPOSE_ACTIVE_ONLY_FILE,'w').write('1')
             elif os.path.exists(EXPOSE_ACTIVE_ONLY_FILE): os.remove(EXPOSE_ACTIVE_ONLY_FILE)
             print(f'[cfgedit] expose_active_only: {v}',flush=True);self.ok(b'OK\n')
+        elif self.path=='/download_opts':
+            self.ok(json.dumps({'connections':read_override(DL_CONNECTIONS_FILE),
+                                'parallel':read_override(DL_PARALLEL_FILE)}).encode(),'application/json')
+        elif self.path in ('/download_connections','/download_parallel'):
+            f=DL_CONNECTIONS_FILE if self.path.endswith('connections') else DL_PARALLEL_FILE
+            v=write_override(f,body.decode())
+            print(f'[cfgedit] {self.path[1:]}: {v or "cleared"}',flush=True);self.ok(b'OK\n')
         elif self.path=='/cache_type':
             v=body.decode().strip()
             if v: open(CACHE_TYPE_FILE,'w').write(v)
@@ -377,6 +406,14 @@ class H(BaseHTTPRequestHandler):
         cur_dm=open(DEFAULT_MODEL_FILE).read().strip() if os.path.exists(DEFAULT_MODEL_FILE) else ''
         cur_ct=open(CACHE_TYPE_FILE).read().strip() if os.path.exists(CACHE_TYPE_FILE) else ''
         cur_eao=expose_active_only()
+        cur_dc=read_override(DL_CONNECTIONS_FILE)
+        cur_dp=read_override(DL_PARALLEL_FILE)
+        dc_opts=''.join(f'<option value="{v}" {"selected" if cur_dc==v else ""}>{lbl}</option>'
+                        for v,lbl in [('','env default'),('1','1'),('2','2'),('4','4'),
+                                      ('8','8'),('16',f'16 (default)')])
+        dp_opts=''.join(f'<option value="{v}" {"selected" if cur_dp==v else ""}>{lbl}</option>'
+                        for v,lbl in [('','env default'),('1','1 (default)'),('2','2'),
+                                      ('3','3'),('4','4'),('6','6'),('8','8')])
         model_ids=get_model_ids()
         dm_opts=f'<option value="" {"selected" if not cur_dm else ""}>env default</option>'
         dm_opts+=''.join(f'<option value="{m}" {"selected" if cur_dm==m else ""}>{m}</option>' for m in model_ids)
@@ -392,6 +429,15 @@ input{{font-family:monospace}}
 #st{{padding:6px;background:#eee;font-size:13px;word-break:break-word}}
 .strow{{margin-bottom:6px}}
 small{{color:#888}}
+.dlrow{{font-size:12px;margin:4px 0}}
+.dlhead{{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}}
+.dlhead b{{font-weight:normal;word-break:break-all}}
+.dlbar{{height:10px;background:#ddd;border-radius:5px;overflow:hidden;margin-top:2px}}
+.dlfill{{height:100%;width:0;background:#4c8bf5;transition:width .5s linear}}
+.dlfill.done{{background:#3aa655}}
+.dlfill.err{{background:#c33}}
+.dlfill.ind{{width:100%;background-image:linear-gradient(90deg,#4c8bf5 25%,#b9d0fa 25%,#b9d0fa 50%,#4c8bf5 50%,#4c8bf5 75%,#b9d0fa 75%);background-size:24px 100%;animation:dlslide 1s linear infinite}}
+@keyframes dlslide{{from{{background-position:0 0}}to{{background-position:24px 0}}}}
 table{{width:100%;border-collapse:collapse;font-size:12px}}
 .bar{{display:flex;flex-wrap:wrap;align-items:center;gap:4px}}
 .bar label{{display:inline-flex;align-items:center;gap:4px}}
@@ -420,6 +466,7 @@ table{{width:100%;border-collapse:collapse;font-size:12px}}
 </style></head>
 <body><h3>llama-swap config.yaml <small style="font-weight:normal">[scripts: {shash}]</small></h3>
 <div class=strow style="display:flex;align-items:flex-start;gap:4px"><div id=st style="flex:1">...</div><button onclick="navigator.clipboard.writeText(document.getElementById('st').textContent)" style="padding:2px 7px;font-size:11px;font-family:monospace;flex-shrink:0">copy</button></div>
+<div id=dlwrap class=strow></div>
 <div class=strow style="display:flex;align-items:center;gap:6px;flex-wrap:wrap"><span id=ctxinfo style="font-size:12px;color:#555">context: (no model loaded)</span><button id=ctxbtn onclick="copyCtx()" style="padding:2px 7px;font-size:11px;font-family:monospace">copy context length</button></div>
 <details id=cd style="margin:2px 0 4px"><summary style="cursor:pointer;user-select:none;font-size:12px;color:#555">&#9658; Active server command <button id=cpycmd onclick="event.preventDefault();var t=document.getElementById('cmdline').textContent;navigator.clipboard.writeText(t).then(function(){{var b=document.getElementById('cpycmd');b.textContent='copied!';setTimeout(function(){{b.textContent='copy';}},2000);}});" style="padding:1px 6px;font-size:11px;font-family:monospace">copy</button></summary><pre id=cmdline style="background:#111;color:#aaa;padding:6px;margin:2px 0;font-size:11px;white-space:pre-wrap;word-break:break-all">(no model loaded)</pre></details>
 <div class=bar>
@@ -430,6 +477,8 @@ table{{width:100%;border-collapse:collapse;font-size:12px}}
 <option value="aria2c" {"selected" if cur=="aria2c" else ""}>aria2c</option>
 <option value="hf" {"selected" if cur=="hf" else ""}>hf (Xet)</option>
 </select></label>
+<label title="Connections aria2c opens per file (aria2c -x/-s)">Connections/file: <select id=dc onchange="setDC(this.value)">{dc_opts}</select></label>
+<label title="How many files (model, mmproj, draft) download at the same time">Parallel downloads: <select id=dp onchange="setDP(this.value)">{dp_opts}</select></label>
 <label>KV cache quant: <select id=ct onchange="setCT(this.value)">
 <option value="" {"selected" if not cur_ct else ""}>env default</option>
 <option value="f16" {"selected" if cur_ct=="f16" else ""}>f16</option>
@@ -466,6 +515,8 @@ table{{width:100%;border-collapse:collapse;font-size:12px}}
 <label>HF_TOKEN<br><input type=password id=s_HF_TOKEN style="width:100%;box-sizing:border-box"></label>
 <label>DOWNLOADER<br><select id=s_DOWNLOADER style="width:100%"><option value="">env default</option><option value="aria2c">aria2c</option><option value="hf">hf (Xet)</option></select></label>
 <label>HF_BACKEND<br><select id=s_HF_BACKEND style="width:100%"><option value="">env default</option><option value="hf_xet">hf_xet</option><option value="hf_transfer">hf_transfer</option></select></label>
+<label title="aria2c connections per file (1-16)">DOWNLOAD_CONNECTIONS<br><input id=s_DOWNLOAD_CONNECTIONS style="width:100%;box-sizing:border-box" placeholder="16"></label>
+<label title="Files downloaded at the same time (1-8)">DOWNLOAD_PARALLEL<br><input id=s_DOWNLOAD_PARALLEL style="width:100%;box-sizing:border-box" placeholder="1"></label>
 <label>CACHE_TYPE_K<br><select id=s_CACHE_TYPE_K style="width:100%"></select></label>
 <label>CACHE_TYPE_V<br><select id=s_CACHE_TYPE_V style="width:100%"></select></label>
 <label>GPU_LAYERS<br><input id=s_GPU_LAYERS style="width:100%;box-sizing:border-box" placeholder="99"></label>
@@ -477,6 +528,7 @@ table{{width:100%;border-collapse:collapse;font-size:12px}}
 </div>
 <h4 style="margin:14px 0 4px">Embeddings <small style="font-weight:normal;color:#888">(always-on sidecar on :8090 &mdash; SillyTavern vector storage)</small></h4>
 <div id=estat style="padding:6px;background:#eee;font-size:12px;margin-bottom:4px">...</div>
+<div id=edl style="margin-bottom:4px"></div>
 <div class=grid>
 <label style="grid-column:1/-1">Preset<br><select id=e_preset onchange="applyPreset(this.value)" style="width:100%"></select></label>
 <label style="grid-column:1/-1">EMBED_MODEL_URL<br><input id=s_EMBED_MODEL_URL style="width:100%;box-sizing:border-box" placeholder="(blank = embeddings disabled)"></label>
@@ -504,6 +556,8 @@ var M=document.getElementById('msg'),E='/editor',lastSaveTs=0,slPaused=false;
 function setDM(v){{fetch(E+'/default_model',{{method:'POST',body:v}}).then(()=>M.textContent='✓ default model set')}}
 function doLoad(){{var v=document.getElementById('dm').value;if(!v){{M.textContent='select a model first';return;}}M.textContent='switching...';fetch(E+'/load',{{method:'POST',body:v}}).then(r=>M.textContent=r.ok?'✓ loading '+v:'✗ '+r.status)}}
 function setDL(v){{fetch(E+'/downloader',{{method:'POST',body:v}}).then(()=>M.textContent='✓ downloader set')}}
+function setDC(v){{fetch(E+'/download_connections',{{method:'POST',body:v}}).then(r=>M.textContent=r.ok?'✓ connections/file set (applies to the next download)':'✗ '+r.status)}}
+function setDP(v){{fetch(E+'/download_parallel',{{method:'POST',body:v}}).then(r=>M.textContent=r.ok?'✓ parallel downloads set (applies to the next download)':'✗ '+r.status)}}
 function setEAO(v){{fetch(E+'/expose_active_only',{{method:'POST',body:v?'1':'0'}}).then(r=>M.textContent=r.ok?(v?'✓ /v1/models now lists only the active model':'✓ /v1/models lists all models'):'✗ '+r.status)}}
 var ctxState={{per:0,total:0,train:0,par:1}};
 function copyCtx(){{
@@ -547,9 +601,10 @@ function collectEmbedding(){{
   }});
   return o;
 }}
+var SETTING_FIELDS={json.dumps(cfginit.PASS_KEYS)};
 function fillSettings(s){{
   s=s||{{}};
-  ['HF_TOKEN','DOWNLOADER','HF_BACKEND','CACHE_TYPE_K','CACHE_TYPE_V','GPU_LAYERS','MLOCK','IMAGE_MIN_TOKENS','IMAGE_MAX_TOKENS','MTMD_BATCH_MAX_TOKENS','COMPUTE_FRACTION'].forEach(function(k){{
+  SETTING_FIELDS.forEach(function(k){{
     var el=document.getElementById('s_'+k); if(el) el.value=s[k]||'';
   }});
 }}
@@ -560,8 +615,8 @@ function collectParams(){{
              draft_model_url:tr.querySelector('.dmurl').value.trim()}};
   }}).filter(function(m){{return m.model_url;}});
   var settings={{}};
-  ['HF_TOKEN','DOWNLOADER','HF_BACKEND','CACHE_TYPE_K','CACHE_TYPE_V','GPU_LAYERS','MLOCK','IMAGE_MIN_TOKENS','IMAGE_MAX_TOKENS','MTMD_BATCH_MAX_TOKENS','COMPUTE_FRACTION'].forEach(function(k){{
-    settings[k]=document.getElementById('s_'+k).value.trim();
+  SETTING_FIELDS.forEach(function(k){{
+    var el=document.getElementById('s_'+k); if(el) settings[k]=el.value.trim();
   }});
   return {{models:models,settings:settings,embedding:collectEmbedding()}};
 }}
@@ -625,12 +680,19 @@ function pollEmbed(){{
     var el=document.getElementById('estat'),st=s.status||'disabled',txt=st;
     if(st==='disabled')txt='disabled — set EMBED_MODEL_URL below to enable';
     else if(st==='ready')txt='ready — '+s.model+(s.dim?(' ('+s.dim+' dim)'):'')+' on :'+(s.port||8090);
-    else if(st==='downloading')txt='downloading '+s.model+' (attempt '+s.attempt+'/'+s.max_attempts+')';
+    else if(st==='downloading'){{
+      txt='downloading '+s.model+' (attempt '+s.attempt+'/'+s.max_attempts+')';
+      if(s.pct!=null)txt+=' — '+s.pct.toFixed(1)+'%';
+    }}
     else if(st==='loading')txt='loading '+s.model;
     else if(st==='error')txt='error: '+s.error;
     txt+=age(s.ts);
     el.style.background={{'error':'#fee','ready':'#dfd','downloading':'#e8f0fe','loading':'#e8f0fe'}}[st]||'#eee';
     el.textContent=txt;
+    var w=document.getElementById('edl');
+    if(w)w.innerHTML=(st==='downloading')?dlLine({{name:s.model,status:'downloading',pct:s.pct,
+      done_mb:s.done_mb,size_mb:s.size_mb,speed_mbps:s.speed_mbps,eta_s:s.eta_s,
+      attempt:s.attempt,max_attempts:s.max_attempts}}):'';
   }}).catch(()=>{{}});
 }}
 loadParams();
@@ -662,19 +724,46 @@ function doPurgeAll(){{
     .catch(e=>M.textContent='✗ '+e);
 }}
 loadCache();
+function fmtEta(s){{
+  if(s==null)return'';
+  if(s<60)return s+'s';
+  if(s<3600)return Math.floor(s/60)+'m '+(s%60)+'s';
+  return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';
+}}
+function dlLine(d){{
+  var pct=(d.pct==null)?null:Math.max(0,Math.min(100,d.pct));
+  var cls=d.status==='error'?'err':(d.status==='done'||d.status==='cached'?'done':(pct==null?'ind':''));
+  var meta=[];
+  if(d.status==='cached')meta.push('cached');
+  else if(d.status==='error')meta.push('failed');
+  else if(d.status==='retrying')meta.push('retry '+(d.attempt||1)+'/'+(d.max_attempts||1)+(d.reason?' ('+d.reason+')':''));
+  if(d.size_mb)meta.push((d.done_mb||0)+' / '+d.size_mb+' MB');
+  else if(d.done_mb)meta.push(d.done_mb+' MB (size unknown)');
+  if(d.status==='downloading'&&d.speed_mbps)meta.push(d.speed_mbps.toFixed(1)+' MB/s');
+  if(d.status==='downloading'&&d.eta_s!=null)meta.push('ETA '+fmtEta(d.eta_s));
+  return '<div class=dlrow><div class=dlhead><b>'+esc(d.name)+'</b><span>'+
+    esc((pct==null?'':pct.toFixed(1)+'%')+(meta.length?(pct==null?'':' · ')+meta.join(' · '):''))+
+    '</span></div><div class=dlbar><div class="dlfill '+cls+'" style="width:'+(pct==null?100:pct)+'%"></div></div></div>';
+}}
+function renderDownloads(s){{
+  var w=document.getElementById('dlwrap'); if(!w)return;
+  var ds=(s&&s.downloads)||[],show=['downloading','retrying','downloaded','cached','error'].indexOf(s.status)>=0;
+  w.innerHTML=(ds.length&&show)?ds.map(dlLine).join(''):'';
+}}
 function age(ts){{if(!ts)return'';var d=Math.floor(Date.now()/1000-ts);if(d<5)return' (just now)';if(d<60)return' ('+d+'s ago)';if(d<3600)return' ('+Math.floor(d/60)+'m ago)';return' ('+Math.floor(d/3600)+'h ago)';}}
 function poll(){{
   Promise.all([fetch(E+'/status').then(r=>r.json()),fetch(E+'/running').then(r=>r.json())])
   .then(([s,r])=>{{
     var st=s.status||'idle',m=r.model,txt=st,el=document.getElementById('st');
     if(m)txt='ready — '+m;
-    else if(st=='downloading')txt='downloading '+(s.pct||0)+'% '+s.model;
+    else if(st=='downloading')txt='downloading '+(s.pct!=null?s.pct+'% ':'')+s.model+(s.speed_mbps?' ('+s.speed_mbps.toFixed(1)+' MB/s)':'');
     else if(st=='loading')txt='loading ctx='+s.ctx+' — '+s.model;
     else if(st=='retrying')txt='retrying '+s.model+' (attempt '+s.attempt+'/'+s.max_attempts+', '+s.reason+')';
     else if(st=='error'){{txt='error: '+s.error;if(s.ts&&s.ts<lastSaveTs)txt+=' — stale (before last save)';}}
     txt+=age(s.ts);
     el.style.background={{'error':'#fee','ready':'#dfd','downloading':'#e8f0fe','loading':'#e8f0fe','retrying':'#fff3cd'}}[st]||'#eee';
     el.textContent=txt;
+    renderDownloads(s);
     ctxState={{per:s.n_ctx_per_slot||0,total:s.ctx||0,train:s.n_ctx_train||0,par:s.par||1}};
     var ci=document.getElementById('ctxinfo');
     if(ci)ci.textContent=ctxState.per
