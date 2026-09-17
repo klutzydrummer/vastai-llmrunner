@@ -49,6 +49,33 @@ at boot, and `/app/expose_active_only` (written by the UI) wins when present.
 The filter never hides everything: if neither a running nor a default model
 matches the listing, the full list is served as before.
 
+## Downloads
+
+While a model is being fetched, `/editor` shows a progress bar per file —
+percent, MB downloaded, speed and ETA — above the status bar, and the same bar
+appears for the embedding model in the **Embeddings** section. A file whose size
+the server won't report gets an indeterminate (striped) bar and a running MB
+count instead. Retries and failures are shown on the bar itself.
+
+Two knobs control download throughput:
+
+| Setting | Default | Notes |
+| --- | --- | --- |
+| `DOWNLOAD_CONNECTIONS` | `16` | connections aria2c opens per file (`-x`/`-s`), 1-16 |
+| `DOWNLOAD_PARALLEL` | `1` | how many files download at once, 1-8 |
+
+A model with an mmproj and a draft model is three separate files, so
+`DOWNLOAD_PARALLEL=3` fetches them together instead of one after another. Disk
+eviction accounts for every download in flight, so raising it can't overfill
+`/models`. `DOWNLOAD_CONNECTIONS` is also used by the embeddings sidecar.
+
+Both are in `/editor` twice: the toolbar selects (**Connections/file**,
+**Parallel downloads**) write `/app/download_connections` and
+`/app/download_parallel` and apply to the next download with no config regen,
+while the **Settings** entries of the same name are written into `config.yaml`
+by **Save & Regenerate**. As with `DOWNLOADER`, the `/app/...` file wins over the
+env var when both are set.
+
 ## Context length
 
 The status bar in `/editor` shows the loaded model's context — tokens per slot,
