@@ -153,6 +153,19 @@ the base model — `--model <base>` plus `--spec-draft-model <mtp-assistant>`.
 Putting the same file in both the **Model URL** and **Draft/MTP URL** fields
 logs a warning.
 
+## Where the model list comes from
+
+The editor header says which source is in effect — `models from: saved params
+(N models)` or `models from: container env defaults`.
+
+`/app/params.json`, written by **Save & Regenerate**, wins over the container's
+`MODEL_URL`, `MODEL_URL_2`, ... env vars. The env vars are used only when no
+usable params file exists (first boot, after **Reset to env defaults**, or if
+the file is unreadable). A saved file with an empty model list is honoured as
+written — it is not treated as "unset", which would silently bring the env
+models back over what was just saved. Saving an empty table asks for
+confirmation first.
+
 ## Configuring the embedding model
 
 In `/editor` → **Embeddings**, choose a preset or paste any GGUF URL, then

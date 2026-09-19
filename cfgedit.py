@@ -316,7 +316,10 @@ class H(BaseHTTPRequestHandler):
         self.send_header('Content-Length',len(b));self.end_headers();self.wfile.write(b)
     def do_GET(self):
         if self.path=='/config': self.ok(open(CONFIG,'rb').read(),'text/yaml')
-        elif self.path=='/params': self.ok(json.dumps(cfginit.load_params()).encode(),'application/json')
+        elif self.path=='/params':
+            _p,_src=cfginit.load_params(with_source=True)
+            _p=dict(_p); _p['source']=_src
+            self.ok(json.dumps(_p).encode(),'application/json')
         elif self.path=='/model_ids': self.ok(json.dumps(get_model_ids()).encode(),'application/json')
         elif self.path=='/update_result': self.ok(json.dumps(read_update_result()).encode(),'application/json')
         elif self.path=='/script_hash': self.ok(script_hash().encode())
@@ -494,6 +497,10 @@ class H(BaseHTTPRequestHandler):
         dp_opts=''.join(f'<option value="{v}" {"selected" if cur_dp==v else ""}>{lbl}</option>'
                         for v,lbl in [('','env default'),('1','1 (default)'),('2','2'),
                                       ('3','3'),('4','4'),('6','6'),('8','8')])
+        _sp,params_src=cfginit.load_params(with_source=True)
+        params_note=('saved params ('+str(len(_sp.get('models') or []))+' model'
+                     +('' if len(_sp.get('models') or [])==1 else 's')+')') if params_src!='env' \
+                    else 'container env defaults'
         model_ids=get_model_ids()
         dm_opts=f'<option value="" {"selected" if not cur_dm else ""}>env default</option>'
         dm_opts+=''.join(f'<option value="{m}" {"selected" if cur_dm==m else ""}>{m}</option>' for m in model_ids)
@@ -544,7 +551,7 @@ table{{width:100%;border-collapse:collapse;font-size:12px}}
   #slog{{height:35vh!important}}
 }}
 </style></head>
-<body><h3>llama-swap config.yaml <small style="font-weight:normal">[scripts: {shash}]</small></h3>
+<body><h3>llama-swap config.yaml <small style="font-weight:normal">[scripts: {shash} &middot; models from: {params_note}]</small></h3>
 <div class=strow style="display:flex;align-items:flex-start;gap:4px"><div id=st style="flex:1">...</div><button onclick="navigator.clipboard.writeText(document.getElementById('st').textContent)" style="padding:2px 7px;font-size:11px;font-family:monospace;flex-shrink:0">copy</button></div>
 <div id=dlwrap class=strow></div>
 <div class=strow style="display:flex;align-items:center;gap:6px;flex-wrap:wrap"><span id=ctxinfo style="font-size:12px;color:#555">context: (no model loaded)</span><button id=ctxbtn onclick="copyCtx()" style="padding:2px 7px;font-size:11px;font-family:monospace">copy context length</button></div>
@@ -748,7 +755,7 @@ function collectParams(){{
   return {{models:models,settings:settings,embedding:collectEmbedding()}};
 }}
 function loadParams(){{
-  fetch(E+'/params').then(r=>r.json()).then(p=>{{
+  fetch(E+'/params',{{cache:'no-store'}}).then(r=>r.json()).then(p=>{{
     document.getElementById('mrows').innerHTML='';
     (p.models||[]).forEach(addRow);
     if(!p.models||!p.models.length) addRow();
@@ -757,8 +764,12 @@ function loadParams(){{
   }}).catch(()=>addRow());
 }}
 function saveParams(){{
-  var pm=document.getElementById('pmsg');pm.textContent='saving...';lastSaveTs=Date.now()/1000;
-  fetch(E+'/params',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(collectParams())}})
+  var pm=document.getElementById('pmsg');
+  var p=collectParams();
+  if(!p.models.length&&!confirm('No model URLs are filled in. Save anyway? The config will have no models.'))
+    {{pm.textContent='save cancelled';return;}}
+  pm.textContent='saving...';lastSaveTs=Date.now()/1000;
+  fetch(E+'/params',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(p)}})
     .then(r=>r.text().then(t=>({{ok:r.ok,t:t}})))
     .then(res=>{{if(res.ok){{document.getElementById('cfg').value=res.t;refreshModels();loadParams();pm.textContent='✓ saved & regenerated';}}else{{pm.textContent='✗ '+res.t;}}}})
     .catch(e=>pm.textContent='✗ '+e);
@@ -772,7 +783,7 @@ function resetParams(){{
     if(!p.models||!p.models.length) addRow();
     fillSettings(p.settings);
     fillEmbedding(p.embedding);
-    return fetch(E+'/config').then(r=>r.text()).then(t=>document.getElementById('cfg').value=t);
+    return fetch(E+'/config',{{cache:'no-store'}}).then(r=>r.text()).then(t=>document.getElementById('cfg').value=t);
   }}).then(refreshModels).then(()=>pm.textContent='✓ reset to env defaults').catch(e=>pm.textContent='✗ '+e);
 }}
 var EMBED_PRESETS={json.dumps(EMBED_PRESETS)};
@@ -803,7 +814,7 @@ function testEmbed(){{
   }}).catch(e=>em.textContent='✗ '+e);
 }}
 function pollEmbed(){{
-  fetch(E+'/embed/status').then(r=>r.json()).then(function(s){{
+  fetch(E+'/embed/status',{{cache:'no-store'}}).then(r=>r.json()).then(function(s){{
     var el=document.getElementById('estat'),st=s.status||'disabled',txt=st;
     if(st==='disabled')txt='disabled — set EMBED_MODEL_URL below to enable';
     else if(st==='ready')txt='ready — '+s.model+(s.dim?(' ('+s.dim+' dim)'):'')+' on :'+(s.port||8090);
@@ -825,7 +836,7 @@ function pollEmbed(){{
 loadParams();
 function fmtSize(n){{if(n>=1073741824)return(n/1073741824).toFixed(1)+'G';if(n>=1048576)return(n/1048576).toFixed(0)+'M';return(n/1024).toFixed(0)+'K';}}
 function loadCache(){{
-  fetch(E+'/cache').then(r=>r.json()).then(files=>{{
+  fetch(E+'/cache',{{cache:'no-store'}}).then(r=>r.json()).then(files=>{{
     var tb=document.getElementById('crows');
     if(!files.length){{tb.innerHTML='<tr><td colspan=4><small>(no cached files)</small></td></tr>';return;}}
     tb.innerHTML=files.map(function(f){{
@@ -879,7 +890,7 @@ function renderDownloads(s){{
 }}
 function age(ts){{if(!ts)return'';var d=Math.floor(Date.now()/1000-ts);if(d<5)return' (just now)';if(d<60)return' ('+d+'s ago)';if(d<3600)return' ('+Math.floor(d/60)+'m ago)';return' ('+Math.floor(d/3600)+'h ago)';}}
 function poll(){{
-  Promise.all([fetch(E+'/status').then(r=>r.json()),fetch(E+'/running').then(r=>r.json())])
+  Promise.all([fetch(E+'/status',{{cache:'no-store'}}).then(r=>r.json()),fetch(E+'/running',{{cache:'no-store'}}).then(r=>r.json())])
   .then(([s,r])=>{{
     var st=s.status||'idle',m=r.model,txt=st,el=document.getElementById('st');
     if(m)txt='ready — '+m;
