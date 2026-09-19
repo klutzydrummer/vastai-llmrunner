@@ -9,6 +9,12 @@ MODEL_DIR='/models'
 DOWNLOADER_FILE='/app/downloader'
 DEFAULT_MODEL_FILE='/app/default_model'
 CACHE_TYPE_FILE='/app/cache_type'
+# What serve.py does when the VRAM budget gives a slot more context than the
+# model was trained for: clamp (ceiling at the trained length), yarn/linear
+# (keep it, extend with RoPE scaling), none (keep it unscaled). This file wins
+# over the CTX_OVERFLOW env var, like /app/cache_type over CACHE_TYPE_K/V.
+CTX_OVERFLOW_FILE='/app/ctx_overflow'
+CTX_OVERFLOW_MODES=['clamp','yarn','linear','none']
 # Download tuning, applied by serve.py without a config regen (same override-file
 # pattern as /app/downloader): connections aria2c opens per file, and how many
 # files (model + mmproj + draft) are fetched at the same time.
@@ -275,6 +281,8 @@ class H(BaseHTTPRequestHandler):
         elif self.path=='/cache_type':
             cur=open(CACHE_TYPE_FILE).read().strip() if os.path.exists(CACHE_TYPE_FILE) else 'env default'
             self.ok(cur.encode())
+        elif self.path=='/ctx_overflow':
+            self.ok(read_override(CTX_OVERFLOW_FILE,'env default').encode())
         elif self.path=='/expose_active_only':
             self.ok(json.dumps({'enabled':expose_active_only()}).encode(),'application/json')
         elif self.path=='/': self._ui()
@@ -344,6 +352,13 @@ class H(BaseHTTPRequestHandler):
             elif os.path.exists(CACHE_TYPE_FILE): os.remove(CACHE_TYPE_FILE)
             unload_all()
             print(f'[cfgedit] cache_type: {v or "cleared"}',flush=True);self.ok(b'OK\n')
+        elif self.path=='/ctx_overflow':
+            v=body.decode().strip().lower()
+            if v and v not in CTX_OVERFLOW_MODES:
+                self.send_response(400);self.end_headers();self.wfile.write(b'unknown mode\n');return
+            v=write_override(CTX_OVERFLOW_FILE,v)
+            unload_all()
+            print(f'[cfgedit] ctx_overflow: {v or "cleared"}',flush=True);self.ok(b'OK\n')
         elif self.path=='/load':
             v=body.decode().strip()
             if v:
@@ -406,6 +421,14 @@ class H(BaseHTTPRequestHandler):
         cur=open(DOWNLOADER_FILE).read().strip() if os.path.exists(DOWNLOADER_FILE) else ''
         cur_dm=open(DEFAULT_MODEL_FILE).read().strip() if os.path.exists(DEFAULT_MODEL_FILE) else ''
         cur_ct=open(CACHE_TYPE_FILE).read().strip() if os.path.exists(CACHE_TYPE_FILE) else ''
+        cur_co=read_override(CTX_OVERFLOW_FILE)
+        co_labels={'clamp':'clamp — cap at trained length (default)',
+                   'yarn':'yarn — RoPE scale past trained length',
+                   'linear':'linear — RoPE scale past trained length',
+                   'none':'none — go past unscaled'}
+        co_opts=f'<option value="" {"selected" if not cur_co else ""}>env default</option>'
+        co_opts+=''.join(f'<option value="{m}" {"selected" if cur_co==m else ""}>{co_labels[m]}</option>'
+                         for m in CTX_OVERFLOW_MODES)
         cur_eao=expose_active_only()
         cur_dc=read_override(DL_CONNECTIONS_FILE)
         cur_dp=read_override(DL_PARALLEL_FILE)
@@ -480,6 +503,7 @@ table{{width:100%;border-collapse:collapse;font-size:12px}}
 </select></label>
 <label title="Connections aria2c opens per file (aria2c -x/-s)">Connections/file: <select id=dc onchange="setDC(this.value)">{dc_opts}</select></label>
 <label title="How many files (model, mmproj, draft) download at the same time">Parallel downloads: <select id=dp onchange="setDP(this.value)">{dp_opts}</select></label>
+<label title="What to do when the VRAM budget gives a slot more context than the model was trained for">Past trained context: <select id=co onchange="setCO(this.value)">{co_opts}</select></label>
 <label>KV cache quant: <select id=ct onchange="setCT(this.value)">
 <option value="" {"selected" if not cur_ct else ""}>env default</option>
 <option value="f16" {"selected" if cur_ct=="f16" else ""}>f16</option>
@@ -526,6 +550,7 @@ table{{width:100%;border-collapse:collapse;font-size:12px}}
 <label>IMAGE_MAX_TOKENS<br><input id=s_IMAGE_MAX_TOKENS style="width:100%;box-sizing:border-box" placeholder="2240"></label>
 <label>MTMD_BATCH_MAX_TOKENS<br><input id=s_MTMD_BATCH_MAX_TOKENS style="width:100%;box-sizing:border-box" placeholder="1024 (raise for video)"></label>
 <label>COMPUTE_FRACTION<br><input id=s_COMPUTE_FRACTION style="width:100%;box-sizing:border-box" placeholder="0.12"></label>
+<label title="Per-model version of the Past trained context control above; /app/ctx_overflow (that control) wins over this">CTX_OVERFLOW<br><select id=s_CTX_OVERFLOW style="width:100%"><option value="">env default (clamp)</option><option value="clamp">clamp</option><option value="yarn">yarn</option><option value="linear">linear</option><option value="none">none</option></select></label>
 </div>
 <h4 style="margin:14px 0 4px">Embeddings <small style="font-weight:normal;color:#888">(always-on sidecar on :8090 &mdash; SillyTavern vector storage)</small></h4>
 <div id=estat style="padding:6px;background:#eee;font-size:12px;margin-bottom:4px">...</div>
@@ -581,6 +606,7 @@ function copyCtx(){{
     b.textContent='copy failed';setTimeout(function(){{b.textContent='copy context length';}},2000);
   }});
 }}
+function setCO(v){{M.textContent='applying...';fetch(E+'/ctx_overflow',{{method:'POST',body:v}}).then(r=>M.textContent=r.ok?'✓ past-trained-context behavior set (unloaded — reload to apply)':'✗ '+r.status)}}
 function setCT(v){{M.textContent='applying...';fetch(E+'/cache_type',{{method:'POST',body:v}}).then(r=>M.textContent=r.ok?'✓ kv cache quant set (unloaded — reload to apply)':'✗ '+r.status)}}
 function doUnload(){{fetch(E+'/unload',{{method:'POST'}}).then(()=>M.textContent='✓ unloaded')}}
 function doRegen(){{M.textContent='regenerating...';fetch(E+'/regen',{{method:'POST'}}).then(r=>r.text()).then(t=>{{document.getElementById('cfg').value=t;refreshModels();M.textContent='✓ config regenerated — save to apply';}}).catch(e=>M.textContent='✗ '+e)}}
@@ -778,7 +804,7 @@ function poll(){{
     ctxState={{per:s.n_ctx_per_slot||0,total:s.ctx||0,train:s.n_ctx_train||0,par:s.par||1}};
     var ci=document.getElementById('ctxinfo');
     if(ci)ci.textContent=ctxState.per
-      ?('context: '+ctxState.per+' tokens per slot ('+ctxState.total+' total across '+ctxState.par+' slot'+(ctxState.par>1?'s':'')+(ctxState.train?', model trained for '+ctxState.train:'')+')')
+      ?('context: '+ctxState.per+' tokens per slot ('+ctxState.total+' total across '+ctxState.par+' slot'+(ctxState.par>1?'s':'')+(ctxState.train?', model trained for '+ctxState.train:'')+')'+(s.ctx_note?' — '+s.ctx_note:''))
       :'context: (no model loaded)';
     var cp=document.getElementById('cmdline');
     if(cp)cp.textContent=s.cmd||(st==='idle'?'(no model loaded)':'...');

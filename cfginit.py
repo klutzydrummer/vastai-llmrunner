@@ -4,7 +4,7 @@ PARAMS_FILE = "/app/params.json"
 PASS_KEYS = ["HF_TOKEN","DOWNLOADER","HF_BACKEND","DOWNLOAD_CONNECTIONS",
              "DOWNLOAD_PARALLEL","CACHE_TYPE_K","CACHE_TYPE_V",
              "GPU_LAYERS","MLOCK","IMAGE_MIN_TOKENS","IMAGE_MAX_TOKENS",
-             "MTMD_BATCH_MAX_TOKENS","COMPUTE_FRACTION"]
+             "MTMD_BATCH_MAX_TOKENS","COMPUTE_FRACTION","CTX_OVERFLOW"]
 # Settings for the always-on embeddings sidecar (embed.py), which runs outside
 # llama-swap so embeddings stay available while chat models are swapped.
 EMBED_KEYS = ["EMBED_MODEL_URL","EMBED_GPU_LAYERS","EMBED_CTX","EMBED_POOLING",
