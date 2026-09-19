@@ -4,7 +4,7 @@ PARAMS_FILE = "/app/params.json"
 PASS_KEYS = ["HF_TOKEN","DOWNLOADER","HF_BACKEND","DOWNLOAD_CONNECTIONS",
              "DOWNLOAD_PARALLEL","CACHE_TYPE_K","CACHE_TYPE_V",
              "GPU_LAYERS","MLOCK","IMAGE_MIN_TOKENS","IMAGE_MAX_TOKENS",
-             "MTMD_BATCH_MAX_TOKENS","COMPUTE_FRACTION","CTX_OVERFLOW"]
+             "MTMD_BATCH_MAX_TOKENS","COMPUTE_FRACTION","CTX_OVERFLOW","FIT"]
 # Settings for the always-on embeddings sidecar (embed.py), which runs outside
 # llama-swap so embeddings stay available while chat models are swapped.
 EMBED_KEYS = ["EMBED_MODEL_URL","EMBED_GPU_LAYERS","EMBED_CTX","EMBED_POOLING",
@@ -26,15 +26,18 @@ def _env_params():
     embedding = {k: os.environ.get(k, "") for k in EMBED_KEYS}
     return {"models": models, "settings": settings, "embedding": embedding}
 
-def load_params():
+def load_params(with_source=False):
     """Params saved via the cfgedit UI (/app/params.json) take priority over
     the container's env vars, mirroring the /app/downloader and /app/cache_type
-    override files. Falls back to env vars (MODEL_URL, MODEL_URL_2, ...) on
-    first boot before any params have been saved."""
+    override files. Falls back to env vars (MODEL_URL, MODEL_URL_2, ...) only
+    when no usable params file exists — a saved file is honoured even when its
+    model list is empty, because falling back there would silently resurrect
+    the container's env models over what was just saved."""
+    source = "env"
     if os.path.exists(PARAMS_FILE):
         try:
             p = json.load(open(PARAMS_FILE))
-            if p.get("models"):
+            if isinstance(p.get("models"), list):
                 p.setdefault("settings", {})
                 for k in PASS_KEYS:
                     p["settings"].setdefault(k, "")
@@ -44,10 +47,11 @@ def load_params():
                 p.setdefault("embedding", {})
                 for k in EMBED_KEYS:
                     p["embedding"].setdefault(k, os.environ.get(k, ""))
-                return p
-        except Exception:
-            pass
-    return _env_params()
+                return (p, PARAMS_FILE) if with_source else p
+        except Exception as e:
+            print(f"[init] warn: {PARAMS_FILE} unusable ({e}), falling back to env", flush=True)
+    p = _env_params()
+    return (p, source) if with_source else p
 
 def save_params(params):
     models = []

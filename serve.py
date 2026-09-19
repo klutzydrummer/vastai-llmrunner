@@ -589,7 +589,11 @@ if mmp and os.path.isfile(mmp):args+=['--mmproj',mmp]
 if os.environ.get('IMAGE_MIN_TOKENS'):args+=['--image-min-tokens',os.environ['IMAGE_MIN_TOKENS']]
 if os.environ.get('IMAGE_MAX_TOKENS'):args+=['--image-max-tokens',os.environ['IMAGE_MAX_TOKENS']]
 if os.environ.get('MTMD_BATCH_MAX_TOKENS'):args+=['--mtmd-batch-max-tokens',os.environ['MTMD_BATCH_MAX_TOKENS']]
-if dmp and os.path.isfile(dmp):args+=['--spec-draft-model',dmp]
+if dmp and os.path.isfile(dmp):
+    args+=['--spec-draft-model',dmp]
+    if dmp==mp:
+        print('[serve] warn: the draft model is the same file as the model — llama.cpp expects the '
+              'MTP assistant GGUF as the draft, next to the base model',flush=True)
 if os.environ.get('DRAFT_N'):args+=['--spec-draft-n-max',os.environ['DRAFT_N']]
 if os.environ.get('MLOCK','0')=='1':args+=['--mlock']
 if len(vrams)>1:
@@ -616,13 +620,42 @@ elif dmp and os.path.isfile(dmp):
         print(f'[serve] MTP: inferred draft_n={draft_n} from draft model filename',flush=True)
 else:
     draft_n=0
+mtp_on=False
 if os.environ.get('NO_MTP','0')=='1':
     args+=['--spec-type','none']
     print('[serve] NO_MTP=1: speculative decoding disabled',flush=True)
 elif draft_n>0:
     print(f'[serve] MTP: arch={arch} mtp_depth={mtp_depth} draft_n={draft_n}',flush=True)
     args+=['--spec-type','draft-mtp','--spec-draft-n-max',str(draft_n)]
+    mtp_on=True
 binary=find_binary()
+
+def supports_flag(b,flag):
+    """Whether this llama-server build knows a flag, so an older binary never
+    gets one it would reject."""
+    try:
+        h=sp.run([b,'--help'],capture_output=True,text=True,timeout=30)
+        return flag in (h.stdout or '')+(h.stderr or '')
+    except Exception as e:
+        print(f'[serve] warn: could not read {b} --help ({e}), skipping {flag}',flush=True)
+        return False
+
+# llama.cpp's automatic memory fitting (--fit, on by default) probes context
+# creation before the real load, and some architectures reject that probe
+# outright — a Gemma-4 MTP assistant aborts with "Gemma4Assistant requires
+# ctx_other to be set". serve.py already picks ctx, batch, ubatch and the GPU
+# split itself, so fitting has nothing left to adjust: turn it off whenever MTP
+# speculation is on. FIT=on/off overrides, FIT=auto (default) is this rule.
+fit=os.environ.get('FIT','auto').strip().lower()
+if fit not in ('auto','on','off'):
+    print(f'[serve] warn: unknown FIT={fit!r}, using auto',flush=True); fit='auto'
+want_fit=fit if fit in ('on','off') else ('off' if mtp_on else '')
+if want_fit:
+    if supports_flag(binary,'--fit'):
+        args+=['--fit',want_fit]
+        print(f'[serve] fit={want_fit}'+('' if fit!='auto' else ' (auto: MTP speculation is on)'),flush=True)
+    else:
+        print(f'[serve] warn: {binary} has no --fit flag, leaving memory fitting as-is',flush=True)
 print(f'[serve] exec {binary} {args}',flush=True)
 write_status({'status':'loading','model':os.path.basename(mp),'ctx':ctx,'n_ctx_train':n_ctx_train,
               'n_ctx_per_slot':ctx//par,'vram_mb':vram_used_mb,'par':par,'port':int(PORT),
