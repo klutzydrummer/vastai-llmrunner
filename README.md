@@ -100,6 +100,31 @@ total context, slot count, and the context the model was trained for — with a
 **copy context length** button that copies the per-slot number, which is the
 value to put in a client's context size setting.
 
+### Going past the trained context
+
+The context is sized from whatever VRAM is left after the weights, so a slot can
+end up with more context than the model was actually trained for — which makes
+llama-server refuse to load, or produce gibberish past the trained length. The
+**Past trained context** dropdown in `/editor` picks what happens when the
+per-slot context (`ctx / parallel`) exceeds the GGUF's `context_length`:
+
+| mode | behaviour |
+| --- | --- |
+| `clamp` (default) | ceiling the context at the trained length — safest, no quality loss |
+| `yarn` | keep the larger context and extend it with YaRN RoPE scaling (`--rope-scaling yarn --rope-scale <factor> --yarn-orig-ctx <trained>`) |
+| `linear` | same, with linear RoPE scaling |
+| `none` | keep the larger context with no scaling — llama-server's own behaviour, which is what used to crash |
+
+`clamp` also applies to an explicit `CTX_SIZE`, so the ceiling is never
+exceeded. When the GGUF does not declare a `context_length`, nothing is changed.
+
+The dropdown writes `/app/ctx_overflow` and unloads the model, so the next load
+uses it; the container env var `CTX_OVERFLOW` sets the boot default, and the
+per-model `CTX_OVERFLOW` field in **Settings** covers models that need a
+different policy. The override file wins over both. The active decision is shown
+in the `/editor` context line (e.g. `— yarn rope scaling x3.00 past the trained
+32768`) and in the server command under **Active server command**.
+
 ## Configuring the embedding model
 
 In `/editor` → **Embeddings**, choose a preset or paste any GGUF URL, then

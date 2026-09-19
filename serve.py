@@ -538,16 +538,53 @@ ub=int(os.environ.get('UBATCH_SIZE','0')) or ub
 if mmp and os.path.isfile(mmp):
     img_max=int(os.environ.get('IMAGE_MAX_TOKENS','2240'))
     ub=max(ub,img_max)
+# ── context vs. trained context ───────────────────────────────────────────────
+# The KV budget above can hand a slot more context than the model was trained
+# for; llama-server then either refuses to load or generates gibberish past the
+# trained length. CTX_OVERFLOW picks what happens, comparing the PER-SLOT
+# context (ctx//par) against the GGUF's context_length:
+#   clamp  — ceiling the context at the trained length (default)
+#   yarn   — keep the larger context, extend it with YaRN RoPE scaling
+#   linear — keep the larger context, extend it with linear RoPE scaling
+#   none   — keep the larger context, no scaling (llama-server's own behaviour)
+# /app/ctx_overflow (written by the editor) wins over the CTX_OVERFLOW env var,
+# the same way /app/cache_type wins over CACHE_TYPE_K/V.
+CTX_OVERFLOW_FILE='/app/ctx_overflow'
+CTX_OVERFLOW_MODES=('clamp','yarn','linear','none')
+co=os.environ.get('CTX_OVERFLOW','').strip().lower()
+if os.path.isfile(CTX_OVERFLOW_FILE):
+    _v=open(CTX_OVERFLOW_FILE).read().strip().lower()
+    if _v: co=_v
+if co not in CTX_OVERFLOW_MODES:
+    if co: print(f'[serve] warn: unknown CTX_OVERFLOW={co!r}, using clamp',flush=True)
+    co='clamp'
+rope_args=[];ctx_note=''
+n_ctx_train=scalar(P('context_length',0))
+if n_ctx_train>0 and ctx//par>n_ctx_train:
+    per=ctx//par
+    if co=='clamp':
+        ctx=n_ctx_train*par
+        ctx_note=f'clamped to the trained {n_ctx_train} per slot'
+    elif co in ('yarn','linear'):
+        factor=per/n_ctx_train
+        rope_args=['--rope-scaling',co,'--rope-scale',f'{factor:.4f}']
+        if co=='yarn': rope_args+=['--yarn-orig-ctx',str(n_ctx_train)]
+        ctx_note=f'{co} rope scaling x{factor:.2f} past the trained {n_ctx_train}'
+    else:
+        ctx_note=f'{per} per slot past the trained {n_ctx_train}, unscaled'
+    print(f'[serve] ctx overflow ({co}): {per} per slot vs trained {n_ctx_train} — {ctx_note}',flush=True)
+if n_ctx_train<=0:
+    n_ctx_train=ctx   # GGUF didn't say; keep reporting something sane
 batch=int(os.environ.get('BATCH_SIZE','0')) or ctx
 vram_used_mb=int(wm+pm2+ctx*kpt/1048576+compute_total/1048576)
-n_ctx_train=scalar(P('context_length',ctx))
 print(f'[serve] arch={arch} nl={nl} nkv={nkv} nh={nh} nk={nk} hd={hd} ffn={ffn}',flush=True)
 print(f'[serve] ctx={ctx} per_slot={ctx//par} batch={batch} ubatch={ub} par={par}',flush=True)
 print(f'[serve] weights={wm:.0f}MB mmproj={pm2:.0f}MB draft={pdraft:.0f}MB embed={pembed:.0f}MB kv={ctx*kpt/1048576:.0f}MB compute~{compute_total/1048576:.0f}MB',flush=True)
-write_status({'status':'loading','model':os.path.basename(mp),'ctx':ctx,'n_ctx_train':n_ctx_train,'n_ctx_per_slot':ctx//par,'vram_mb':vram_used_mb,'par':par,'port':int(PORT),'ts':int(time.time())})
+write_status({'status':'loading','model':os.path.basename(mp),'ctx':ctx,'n_ctx_train':n_ctx_train,'n_ctx_per_slot':ctx//par,'vram_mb':vram_used_mb,'par':par,'port':int(PORT),'ts':int(time.time()),'ctx_overflow':co,'ctx_note':ctx_note})
 args=['--model',mp,'--ctx-size',str(ctx),'--batch-size',str(batch),'--ubatch-size',str(ub),'--parallel',str(par)]
 args+=['--host','0.0.0.0','--port',PORT]
 args+=['--cache-type-k',ct,'--cache-type-v',ctv]
+args+=rope_args
 if mmp and os.path.isfile(mmp):args+=['--mmproj',mmp]
 if os.environ.get('IMAGE_MIN_TOKENS'):args+=['--image-min-tokens',os.environ['IMAGE_MIN_TOKENS']]
 if os.environ.get('IMAGE_MAX_TOKENS'):args+=['--image-max-tokens',os.environ['IMAGE_MAX_TOKENS']]
@@ -589,7 +626,8 @@ binary=find_binary()
 print(f'[serve] exec {binary} {args}',flush=True)
 write_status({'status':'loading','model':os.path.basename(mp),'ctx':ctx,'n_ctx_train':n_ctx_train,
               'n_ctx_per_slot':ctx//par,'vram_mb':vram_used_mb,'par':par,'port':int(PORT),
-              'ts':int(time.time()),'cmd':binary+' '+' '.join(args)})
+              'ts':int(time.time()),'ctx_overflow':co,'ctx_note':ctx_note,
+              'cmd':binary+' '+' '.join(args)})
 for _p in [mp]+([mmp] if mmp and os.path.isfile(mmp) else [])+([dmp] if dmp and os.path.isfile(dmp) else []):
     try: open(_p+'.pid','w').write(str(os.getpid()))
     except: pass
