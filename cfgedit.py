@@ -30,6 +30,9 @@ LLAMA_SWAP_HOST='localhost'; LLAMA_SWAP_PORT=8080
 SCRIPTS_BASE='https://raw.githubusercontent.com/klutzydrummer/vastai-llmrunner/main'
 SCRIPTS=['serve.py','cfgedit.py','guard.py','cfginit.py','embed.py','init.sh']
 EMBED_STATUS='/tmp/embed_status.json'
+# Outcome of the last "Update Scripts" run, read back by the UI after the
+# editor re-execs so it can say which files actually changed.
+UPDATE_RESULT='/tmp/update_result.json'
 EMBED_PORT=8090
 # Suggested small embedding models. All are GGUF; pick one in the UI or paste
 # any other .gguf URL. "pooling" is only set where the model needs a value that
@@ -63,6 +66,14 @@ def write_override(path,value):
     elif os.path.exists(path): os.remove(path)
     return v
 
+def write_update_result(d):
+    try: open(UPDATE_RESULT,'w').write(json.dumps(d))
+    except OSError: pass
+
+def read_update_result():
+    try: return json.loads(open(UPDATE_RESULT).read())
+    except Exception: return {}
+
 def script_hash():
     h=hashlib.sha256()
     for f in SCRIPTS:
@@ -82,15 +93,52 @@ def tail(path,n=300):
         lines=open(path).readlines(); return ''.join(lines[-n:])
     except: return f'(no log at {path})\n'
 
+def fetch_script(f):
+    """Fetch one script from GitHub, defeating caches.
+
+    raw.githubusercontent.com answers with Cache-Control: max-age=300, so for
+    up to five minutes after a push an edge node (or any proxy in between) will
+    happily hand back the previous copy — which looks exactly like "Update
+    Scripts didn't pick it up". A unique query string plus no-cache request
+    headers gets the current file instead."""
+    url=f'{SCRIPTS_BASE}/{f}?cb={int(time.time()*1000)}'
+    req=urllib.request.Request(url,headers={'Cache-Control':'no-cache','Pragma':'no-cache'})
+    with urllib.request.urlopen(req,timeout=60) as r:
+        return r.read()
+
 def update_scripts():
-    for f in SCRIPTS:
-        urllib.request.urlretrieve(f'{SCRIPTS_BASE}/{f}',f'/tmp/{f}')
+    """Replace /tmp/*.py from GitHub, then restart guard and this editor.
+
+    Everything is fetched and syntax-checked before anything is written, so a
+    failed download or a broken file can't leave a half-updated container."""
+    result={'ok':False,'ts':int(time.time()),'changed':[],'hash':script_hash()}
+    try:
+        new={f:fetch_script(f) for f in SCRIPTS}
+    except Exception as e:
+        result['error']=f'download failed: {e}'
+        write_update_result(result); print(f'[cfgedit] update: {result["error"]}',flush=True); return
+    for f,data in new.items():
+        if not f.endswith('.py'): continue
+        try: compile(data.decode('utf-8'),f,'exec')
+        except (SyntaxError,UnicodeDecodeError) as e:
+            result['error']=f'{f} did not parse, nothing replaced: {e}'
+            write_update_result(result); print(f'[cfgedit] update: {result["error"]}',flush=True); return
+    for f,data in new.items():
+        path=f'/tmp/{f}'
+        try: old=open(path,'rb').read()
+        except OSError: old=None
+        if old!=data:
+            result['changed'].append(f)
+            open(path,'wb').write(data)
     os.chmod('/tmp/init.sh',0o755)
+    result['ok']=True; result['hash']=script_hash()
+    write_update_result(result)
+    print(f'[cfgedit] update: {result["changed"] or "no changes"} (scripts: {result["hash"]})',flush=True)
     subprocess.run(['pkill','-f','/tmp/guard.py'],check=False)
     subprocess.Popen([sys.executable,'/tmp/guard.py'],
                      stdout=open('/tmp/guard.log','a'),stderr=subprocess.STDOUT)
     print('[cfgedit] restarting with updated script',flush=True)
-    import time; time.sleep(0.3)
+    time.sleep(0.3)
     os.execv(sys.executable,[sys.executable,'/tmp/cfgedit.py'])
 
 def llama_swap(method,path,body=None):
@@ -261,11 +309,17 @@ class H(BaseHTTPRequestHandler):
     def log_message(self,fmt,*a): print(f'[cfgedit] {self.address_string()} {fmt%a}',flush=True)
     def ok(self,b,ct='text/plain'):
         b=b if isinstance(b,bytes) else b.encode()
-        self.send_response(200);self.send_header('Content-Type',ct);self.send_header('Content-Length',len(b));self.end_headers();self.wfile.write(b)
+        self.send_response(200);self.send_header('Content-Type',ct)
+        # everything here is live state, and a cached /editor page after an
+        # update looks exactly like the update not having happened
+        self.send_header('Cache-Control','no-store, must-revalidate')
+        self.send_header('Content-Length',len(b));self.end_headers();self.wfile.write(b)
     def do_GET(self):
         if self.path=='/config': self.ok(open(CONFIG,'rb').read(),'text/yaml')
         elif self.path=='/params': self.ok(json.dumps(cfginit.load_params()).encode(),'application/json')
         elif self.path=='/model_ids': self.ok(json.dumps(get_model_ids()).encode(),'application/json')
+        elif self.path=='/update_result': self.ok(json.dumps(read_update_result()).encode(),'application/json')
+        elif self.path=='/script_hash': self.ok(script_hash().encode())
         elif self.path=='/status': self.ok(json.dumps(get_status()).encode(),'application/json')
         elif self.path=='/running': self.ok(json.dumps({'model':get_running()}).encode(),'application/json')
         elif self.path=='/cache': self.ok(json.dumps(list_cache()).encode(),'application/json')
@@ -373,6 +427,8 @@ class H(BaseHTTPRequestHandler):
         elif self.path=='/embed/test':
             self.ok(json.dumps(embed_test()).encode(),'application/json')
         elif self.path=='/update':
+            try: os.remove(UPDATE_RESULT)
+            except OSError: pass
             self.ok(b'OK\n')
             threading.Thread(target=update_scripts,daemon=True).start()
         elif self.path=='/regen':
@@ -579,6 +635,7 @@ SillyTavern &rarr; Vector Storage: source <b>vLLM</b> (or any OpenAI-compatible)
 </details>
 <script>
 var M=document.getElementById('msg'),E='/editor',lastSaveTs=0,slPaused=false;
+var SCRIPT_HASH='{shash}';
 function refreshModels(){{
   var sel=document.getElementById('dm');if(!sel)return Promise.resolve();
   var want=sel.value;
@@ -610,7 +667,39 @@ function setCO(v){{M.textContent='applying...';fetch(E+'/ctx_overflow',{{method:
 function setCT(v){{M.textContent='applying...';fetch(E+'/cache_type',{{method:'POST',body:v}}).then(r=>M.textContent=r.ok?'✓ kv cache quant set (unloaded — reload to apply)':'✗ '+r.status)}}
 function doUnload(){{fetch(E+'/unload',{{method:'POST'}}).then(()=>M.textContent='✓ unloaded')}}
 function doRegen(){{M.textContent='regenerating...';fetch(E+'/regen',{{method:'POST'}}).then(r=>r.text()).then(t=>{{document.getElementById('cfg').value=t;refreshModels();M.textContent='✓ config regenerated — save to apply';}}).catch(e=>M.textContent='✗ '+e)}}
-function doUpdate(){{M.textContent='updating...';fetch(E+'/update',{{method:'POST'}}).then(()=>{{M.textContent='restarting...';var t=Date.now();(function wait(){{fetch(E+'/status',{{cache:'no-store'}}).then(()=>location.href=location.pathname).catch(()=>{{if(Date.now()-t<30000)setTimeout(wait,800);else location.href=location.pathname;}});}})();}}).catch(()=>{{M.textContent='restarting...';setTimeout(()=>location.href=location.pathname,6000);}})}}
+function doUpdate(){{
+  M.textContent='updating...';
+  var before=SCRIPT_HASH;
+  fetch(E+'/update',{{method:'POST'}}).then(function(){{
+    M.textContent='restarting...';
+    var t=Date.now();
+    (function wait(){{
+      fetch(E+'/update_result',{{cache:'no-store'}}).then(function(r){{
+        // updated to a build without this endpoint: nothing to report, just reload
+        if(r.status===404){{location.href=location.pathname;return null;}}
+        return r.json();
+      }}).then(function(res){{
+        if(res===null)return;
+        if(!res||!res.ts){{
+          // editor is back up but the fetch is still running, or it died early
+          if(Date.now()-t<60000){{setTimeout(wait,800);return;}}
+          M.textContent='✗ no update result — check the cfgedit log';return;
+        }}
+        if(!res.ok){{M.textContent='✗ '+(res.error||'update failed');return;}}
+        if(res.changed&&res.changed.length){{
+          M.textContent='✓ updated '+res.changed.join(', ')+' (scripts: '+res.hash+') — reloading';
+          setTimeout(()=>location.href=location.pathname,1500);
+        }}else{{
+          M.textContent='• already up to date at '+res.hash+(res.hash===before?'':' (was '+before+')')
+            +' — GitHub serves raw files with a 5 min cache, so a fresh push can take a moment';
+        }}
+      }}).catch(function(){{
+        if(Date.now()-t<60000)setTimeout(wait,800);
+        else location.href=location.pathname;
+      }});
+    }})();
+  }}).catch(()=>{{M.textContent='restarting...';setTimeout(()=>location.href=location.pathname,6000);}})
+}}
 function doSave(){{M.textContent='saving...';lastSaveTs=Date.now()/1000;fetch(E+'/config',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:'cfg='+encodeURIComponent(document.getElementById('cfg').value)}}).then(r=>{{refreshModels();M.textContent=r.ok?'✓ saved':'✗ '+r.status;}})}}
 var CACHE_OPTS=['f16','q8_0','q4_0','q4_1','q5_0','q5_1','f32'];
 function esc(s){{return String(s==null?'':s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');}}

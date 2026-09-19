@@ -39,8 +39,12 @@ wait_port(){
 update_scripts(){
     local base="https://raw.githubusercontent.com/klutzydrummer/vastai-llmrunner/main"
     local f failed=0
+    # raw.githubusercontent.com sends Cache-Control: max-age=300, so a container
+    # started just after a push can otherwise boot the previous copy. A unique
+    # query string plus no-cache skips the edge cache.
+    local cb; cb=$(date +%s%N)
     for f in serve.py cfginit.py cfgedit.py guard.py embed.py; do
-        if curl -fsSL --max-time 30 "$base/$f" -o "/tmp/$f"; then
+        if curl -fsSL --max-time 30 -H 'Cache-Control: no-cache' "$base/$f?cb=$cb" -o "/tmp/$f"; then
             LOG "updated $f"
         else
             LOG "warn: could not update $f (keeping existing)"
