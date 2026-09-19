@@ -457,7 +457,8 @@ class H(BaseHTTPRequestHandler):
                 if params.get('embedding',{})!=before:
                     threading.Thread(target=restart_embed,daemon=True).start()
                 print(f'[cfgedit] params saved, regenerated config with {found} model(s)',flush=True)
-                self.ok(cfg.encode(),'text/yaml')
+                saved=dict(params); saved['source']=cfginit.PARAMS_FILE
+                self.ok(json.dumps({'config':cfg,'params':saved}).encode(),'application/json')
             except Exception as e:
                 self.send_response(400);self.end_headers();self.wfile.write(str(e).encode())
                 print(f'[cfgedit] params error: {e}',flush=True)
@@ -754,14 +755,16 @@ function collectParams(){{
   }});
   return {{models:models,settings:settings,embedding:collectEmbedding()}};
 }}
+function renderParams(p){{
+  p=p||{{}};
+  document.getElementById('mrows').innerHTML='';
+  (p.models||[]).forEach(addRow);
+  if(!p.models||!p.models.length) addRow();
+  fillSettings(p.settings);
+  fillEmbedding(p.embedding);
+}}
 function loadParams(){{
-  fetch(E+'/params',{{cache:'no-store'}}).then(r=>r.json()).then(p=>{{
-    document.getElementById('mrows').innerHTML='';
-    (p.models||[]).forEach(addRow);
-    if(!p.models||!p.models.length) addRow();
-    fillSettings(p.settings);
-    fillEmbedding(p.embedding);
-  }}).catch(()=>addRow());
+  fetch(E+'/params',{{cache:'no-store'}}).then(r=>r.json()).then(renderParams).catch(()=>addRow());
 }}
 function saveParams(){{
   var pm=document.getElementById('pmsg');
@@ -771,7 +774,18 @@ function saveParams(){{
   pm.textContent='saving...';lastSaveTs=Date.now()/1000;
   fetch(E+'/params',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(p)}})
     .then(r=>r.text().then(t=>({{ok:r.ok,t:t}})))
-    .then(res=>{{if(res.ok){{document.getElementById('cfg').value=res.t;refreshModels();loadParams();pm.textContent='✓ saved & regenerated';}}else{{pm.textContent='✗ '+res.t;}}}})
+    .then(res=>{{
+      if(!res.ok){{pm.textContent='✗ '+res.t;return;}}
+      var d;
+      try{{d=JSON.parse(res.t);}}catch(e){{pm.textContent='✗ unexpected reply: '+res.t.slice(0,120);return;}}
+      document.getElementById('cfg').value=d.config;
+      // repaint from what the server stored, never from a second GET that a
+      // cache could answer with the previous params
+      renderParams(d.params);
+      refreshModels();
+      var n=(d.params.models||[]).length;
+      pm.textContent='✓ saved '+n+' model'+(n===1?'':'s')+' & regenerated';
+    }})
     .catch(e=>pm.textContent='✗ '+e);
 }}
 function resetParams(){{
