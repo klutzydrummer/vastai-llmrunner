@@ -594,6 +594,8 @@ table{{width:100%;border-collapse:collapse;font-size:12px}}
 <tbody id=mrows></tbody>
 </table>
 <button onclick="addRow()">+ Add model</button>
+<button onclick="saveParams()" style="font-weight:bold">Save &amp; Regenerate</button>
+<span id=pmsg2 style="font-size:12px;color:#888;margin-left:6px"></span>
 <h4 style="margin:14px 0 4px">Cached model files <button onclick="doPurgeAll()" style="color:#a00">Purge all</button> <button onclick="loadCache()" style="font-size:11px">&#8635;</button></h4>
 <table id=ctbl>
 <thead><tr style="text-align:left"><th style="width:60%">File</th><th style="width:15%">Size</th><th style="width:15%">Status</th><th></th></tr></thead>
@@ -635,7 +637,8 @@ SillyTavern &rarr; Vector Storage: source <b>vLLM</b> (or any OpenAI-compatible)
 <div style="margin:10px 0"><button onclick="saveParams()">Save &amp; Regenerate</button><button onclick="resetParams()">Reset to env defaults</button><span id=pmsg style="font-size:12px;color:#888;margin-left:6px"></span></div>
 <details id=raw style="margin-top:6px"><summary style="cursor:pointer;user-select:none;font-size:12px;color:#555">&#9658; Advanced: raw config.yaml (overwritten by Save &amp; Regenerate above)</summary>
 <textarea id=cfg>{d}</textarea>
-<div style="margin:4px 0"><button onclick="doSave()">Save raw &amp; Reload</button></div>
+<div style="margin:4px 0"><button onclick="doSave()">Overwrite config.yaml with this text</button>
+<small style="color:#a00">ignores the Models table above &mdash; use &ldquo;Save &amp; Regenerate&rdquo; for model changes</small></div>
 </details>
 <details id=sd><summary style="cursor:pointer;user-select:none;margin-top:4px">&#9658; Model output (serve &middot; aria2c &middot; llama-server)</summary>
 <div style="margin:2px 0"><button id=slpb onclick="slPaused=!slPaused;this.textContent=slPaused?'&#9654; Resume':'&#9208; Pause'" style="margin:2px;padding:2px 8px;font-family:monospace">&#9208; Pause</button>
@@ -766,31 +769,40 @@ function renderParams(p){{
 function loadParams(){{
   fetch(E+'/params',{{cache:'no-store'}}).then(r=>r.json()).then(renderParams).catch(()=>addRow());
 }}
+function setPmsg(t,bad){{
+  ['pmsg','pmsg2'].forEach(function(id){{
+    var el=document.getElementById(id); if(!el)return;
+    el.textContent=t; el.style.color=bad?'#a00':''; el.style.fontWeight=bad?'bold':'';
+  }});
+}}
 function saveParams(){{
-  var pm=document.getElementById('pmsg');
   var p=collectParams();
   if(!p.models.length&&!confirm('No model URLs are filled in. Save anyway? The config will have no models.'))
-    {{pm.textContent='save cancelled';return;}}
-  pm.textContent='saving...';lastSaveTs=Date.now()/1000;
+    {{setPmsg('save cancelled',false);return;}}
+  setPmsg('saving...',false);lastSaveTs=Date.now()/1000;
   fetch(E+'/params',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(p)}})
     .then(r=>r.text().then(t=>({{ok:r.ok,t:t}})))
     .then(res=>{{
-      if(!res.ok){{pm.textContent='✗ '+res.t;return;}}
+      if(!res.ok){{
+        setPmsg('✗ NOT SAVED: '+res.t,true);
+        alert('Save failed — nothing was written:\n\n'+res.t);
+        return;
+      }}
       var d;
-      try{{d=JSON.parse(res.t);}}catch(e){{pm.textContent='✗ unexpected reply: '+res.t.slice(0,120);return;}}
+      try{{d=JSON.parse(res.t);}}catch(e){{setPmsg('✗ unexpected reply: '+res.t.slice(0,120),true);return;}}
       document.getElementById('cfg').value=d.config;
       // repaint from what the server stored, never from a second GET that a
       // cache could answer with the previous params
       renderParams(d.params);
       refreshModels();
       var n=(d.params.models||[]).length;
-      pm.textContent='✓ saved '+n+' model'+(n===1?'':'s')+' & regenerated';
+      setPmsg('✓ saved '+n+' model'+(n===1?'':'s')+' & regenerated',false);
     }})
-    .catch(e=>pm.textContent='✗ '+e);
+    .catch(e=>setPmsg('✗ '+e,true));
 }}
 function resetParams(){{
   if(!confirm('Discard saved params and regenerate from the container env vars?'))return;
-  var pm=document.getElementById('pmsg');pm.textContent='resetting...';lastSaveTs=Date.now()/1000;
+  setPmsg('resetting...',false);lastSaveTs=Date.now()/1000;
   fetch(E+'/params/reset',{{method:'POST'}}).then(r=>r.json()).then(p=>{{
     document.getElementById('mrows').innerHTML='';
     (p.models||[]).forEach(addRow);
@@ -798,7 +810,7 @@ function resetParams(){{
     fillSettings(p.settings);
     fillEmbedding(p.embedding);
     return fetch(E+'/config',{{cache:'no-store'}}).then(r=>r.text()).then(t=>document.getElementById('cfg').value=t);
-  }}).then(refreshModels).then(()=>pm.textContent='✓ reset to env defaults').catch(e=>pm.textContent='✗ '+e);
+  }}).then(refreshModels).then(()=>setPmsg('✓ reset to env defaults',false)).catch(e=>setPmsg('✗ '+e,true));
 }}
 var EMBED_PRESETS={json.dumps(EMBED_PRESETS)};
 var EMBED_FIELDS={json.dumps(cfginit.EMBED_KEYS)};

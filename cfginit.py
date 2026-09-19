@@ -69,7 +69,22 @@ def save_params(params):
     settings = {k: (params.get("settings", {}).get(k) or "").strip() for k in PASS_KEYS}
     embedding = {k: (params.get("embedding", {}).get(k) or "").strip() for k in EMBED_KEYS}
     p = {"models": models, "settings": settings, "embedding": embedding}
-    open(PARAMS_FILE, "w").write(json.dumps(p, indent=2))
+    # Write atomically, then read back: a save that silently fails to reach disk
+    # looks exactly like the UI "reverting", because the next load falls back to
+    # whatever was there before. Fail loudly instead.
+    blob = json.dumps(p, indent=2)
+    tmp = PARAMS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(blob)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, PARAMS_FILE)
+    back = json.load(open(PARAMS_FILE))
+    if back != p:
+        raise RuntimeError(f"{PARAMS_FILE} did not keep what was written "
+                           f"(saved {len(models)} model(s), read back "
+                           f"{len(back.get('models') or [])}) — is it writable?")
+    print(f"[init] saved {len(models)} model(s) to {PARAMS_FILE}", flush=True)
     return p
 
 def model_stem(url):
