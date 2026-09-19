@@ -775,7 +775,12 @@ function saveParams(){{
   fetch(E+'/params',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(p)}})
     .then(r=>r.text().then(t=>({{ok:r.ok,t:t}})))
     .then(res=>{{
-      if(!res.ok){{pm.textContent='✗ '+res.t;return;}}
+      if(!res.ok){{
+        pm.textContent='✗ NOT SAVED: '+res.t;pm.style.color='#a00';pm.style.fontWeight='bold';
+        alert('Save failed — nothing was written:\n\n'+res.t);
+        return;
+      }}
+      pm.style.color='';pm.style.fontWeight='';
       var d;
       try{{d=JSON.parse(res.t);}}catch(e){{pm.textContent='✗ unexpected reply: '+res.t.slice(0,120);return;}}
       document.getElementById('cfg').value=d.config;
