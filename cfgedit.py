@@ -259,6 +259,7 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path=='/config': self.ok(open(CONFIG,'rb').read(),'text/yaml')
         elif self.path=='/params': self.ok(json.dumps(cfginit.load_params()).encode(),'application/json')
+        elif self.path=='/model_ids': self.ok(json.dumps(get_model_ids()).encode(),'application/json')
         elif self.path=='/status': self.ok(json.dumps(get_status()).encode(),'application/json')
         elif self.path=='/running': self.ok(json.dumps({'model':get_running()}).encode(),'application/json')
         elif self.path=='/cache': self.ok(json.dumps(list_cache()).encode(),'application/json')
@@ -293,13 +294,13 @@ class H(BaseHTTPRequestHandler):
     def do_PUT(self):
         if self.path=='/config':
             n=int(self.headers.get('Content-Length',0));d=self.rfile.read(n)
-            unload_all();open(CONFIG,'wb').write(d);self.ok(b'OK\n')
+            unload_all();cfginit.write_config(d.decode(),CONFIG);self.ok(b'OK\n')
         else: self.send_response(404);self.end_headers()
     def do_POST(self):
         n=int(self.headers.get('Content-Length',0));body=self.rfile.read(n)
         if self.path=='/config':
             cfg=urllib.parse.parse_qs(body.decode()).get('cfg',[''])[0]
-            unload_all();open(CONFIG,'w').write(cfg);self.ok(b'OK\n')
+            unload_all();cfginit.write_config(cfg,CONFIG);self.ok(b'OK\n')
         elif self.path=='/unload': unload_all();self.ok(b'OK\n')
         elif self.path=='/cache/purge':
             try:
@@ -377,7 +378,7 @@ class H(BaseHTTPRequestHandler):
                 before=cfginit.load_params().get('embedding',{})
                 params=cfginit.save_params(json.loads(body.decode()))
                 cfg,found=cfginit.build_config(params)
-                open(CONFIG,'w').write(cfg)
+                cfginit.write_config(cfg,CONFIG)
                 unload_all()
                 if params.get('embedding',{})!=before:
                     threading.Thread(target=restart_embed,daemon=True).start()
@@ -391,7 +392,7 @@ class H(BaseHTTPRequestHandler):
                 if os.path.exists(cfginit.PARAMS_FILE): os.remove(cfginit.PARAMS_FILE)
                 params=cfginit.load_params()
                 cfg,found=cfginit.build_config(params)
-                open(CONFIG,'w').write(cfg)
+                cfginit.write_config(cfg,CONFIG)
                 unload_all()
                 threading.Thread(target=restart_embed,daemon=True).start()
                 print(f'[cfgedit] params reset to env defaults, {found} model(s)',flush=True)
@@ -553,6 +554,16 @@ SillyTavern &rarr; Vector Storage: source <b>vLLM</b> (or any OpenAI-compatible)
 </details>
 <script>
 var M=document.getElementById('msg'),E='/editor',lastSaveTs=0,slPaused=false;
+function refreshModels(){{
+  var sel=document.getElementById('dm');if(!sel)return Promise.resolve();
+  var want=sel.value;
+  return fetch(E+'/model_ids',{{cache:'no-store'}}).then(r=>r.json()).then(function(ids){{
+    sel.innerHTML='<option value="">env default</option>'+ids.map(function(m){{
+      return '<option value="'+esc(m)+'">'+esc(m)+'</option>';
+    }}).join('');
+    sel.value=(ids.indexOf(want)>=0)?want:'';
+  }}).catch(function(){{}});
+}}
 function setDM(v){{fetch(E+'/default_model',{{method:'POST',body:v}}).then(()=>M.textContent='✓ default model set')}}
 function doLoad(){{var v=document.getElementById('dm').value;if(!v){{M.textContent='select a model first';return;}}M.textContent='switching...';fetch(E+'/load',{{method:'POST',body:v}}).then(r=>M.textContent=r.ok?'✓ loading '+v:'✗ '+r.status)}}
 function setDL(v){{fetch(E+'/downloader',{{method:'POST',body:v}}).then(()=>M.textContent='✓ downloader set')}}
@@ -572,9 +583,9 @@ function copyCtx(){{
 }}
 function setCT(v){{M.textContent='applying...';fetch(E+'/cache_type',{{method:'POST',body:v}}).then(r=>M.textContent=r.ok?'✓ kv cache quant set (unloaded — reload to apply)':'✗ '+r.status)}}
 function doUnload(){{fetch(E+'/unload',{{method:'POST'}}).then(()=>M.textContent='✓ unloaded')}}
-function doRegen(){{M.textContent='regenerating...';fetch(E+'/regen',{{method:'POST'}}).then(r=>r.text()).then(t=>{{document.getElementById('cfg').value=t;M.textContent='✓ config regenerated — save to apply';}}).catch(e=>M.textContent='✗ '+e)}}
+function doRegen(){{M.textContent='regenerating...';fetch(E+'/regen',{{method:'POST'}}).then(r=>r.text()).then(t=>{{document.getElementById('cfg').value=t;refreshModels();M.textContent='✓ config regenerated — save to apply';}}).catch(e=>M.textContent='✗ '+e)}}
 function doUpdate(){{M.textContent='updating...';fetch(E+'/update',{{method:'POST'}}).then(()=>{{M.textContent='restarting...';var t=Date.now();(function wait(){{fetch(E+'/status',{{cache:'no-store'}}).then(()=>location.href=location.pathname).catch(()=>{{if(Date.now()-t<30000)setTimeout(wait,800);else location.href=location.pathname;}});}})();}}).catch(()=>{{M.textContent='restarting...';setTimeout(()=>location.href=location.pathname,6000);}})}}
-function doSave(){{M.textContent='saving...';lastSaveTs=Date.now()/1000;fetch(E+'/config',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:'cfg='+encodeURIComponent(document.getElementById('cfg').value)}}).then(r=>M.textContent=r.ok?'✓ saved':'✗ '+r.status)}}
+function doSave(){{M.textContent='saving...';lastSaveTs=Date.now()/1000;fetch(E+'/config',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:'cfg='+encodeURIComponent(document.getElementById('cfg').value)}}).then(r=>{{refreshModels();M.textContent=r.ok?'✓ saved':'✗ '+r.status;}})}}
 var CACHE_OPTS=['f16','q8_0','q4_0','q4_1','q5_0','q5_1','f32'];
 function esc(s){{return String(s==null?'':s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');}}
 function cacheOptsHtml(sel){{return '<option value="">env default</option>'+CACHE_OPTS.map(function(o){{return '<option value="'+o+'"'+(sel===o?' selected':'')+'>'+o+(o==='q8_0'?' (default)':'')+'</option>';}}).join('');}}
@@ -633,7 +644,7 @@ function saveParams(){{
   var pm=document.getElementById('pmsg');pm.textContent='saving...';lastSaveTs=Date.now()/1000;
   fetch(E+'/params',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(collectParams())}})
     .then(r=>r.text().then(t=>({{ok:r.ok,t:t}})))
-    .then(res=>{{if(res.ok){{document.getElementById('cfg').value=res.t;pm.textContent='✓ saved & regenerated';}}else{{pm.textContent='✗ '+res.t;}}}})
+    .then(res=>{{if(res.ok){{document.getElementById('cfg').value=res.t;refreshModels();loadParams();pm.textContent='✓ saved & regenerated';}}else{{pm.textContent='✗ '+res.t;}}}})
     .catch(e=>pm.textContent='✗ '+e);
 }}
 function resetParams(){{
@@ -646,7 +657,7 @@ function resetParams(){{
     fillSettings(p.settings);
     fillEmbedding(p.embedding);
     return fetch(E+'/config').then(r=>r.text()).then(t=>document.getElementById('cfg').value=t);
-  }}).then(()=>pm.textContent='✓ reset to env defaults').catch(e=>pm.textContent='✗ '+e);
+  }}).then(refreshModels).then(()=>pm.textContent='✓ reset to env defaults').catch(e=>pm.textContent='✗ '+e);
 }}
 var EMBED_PRESETS={json.dumps(EMBED_PRESETS)};
 var EMBED_FIELDS={json.dumps(cfginit.EMBED_KEYS)};

@@ -36,6 +36,23 @@ the same time, from the same base URL.
 Re-vectorize your chats after changing the embedding model: different models
 produce different vector spaces and dimensions.
 
+## Model IDs in the editor
+
+Each row in the editor's **Models** table becomes four entries in
+`config.yaml` — `<name>-p1`/`-p2`/`-p4`/`-p8` — where `<name>` comes from the
+GGUF file name in the model URL, minus the `.gguf` extension and any
+`?download=true` style query string.
+
+Two different models can share a file name (the same quant published by two
+repos, for example). Those names are made unique: the first model to claim a
+name keeps it, and a later one is prefixed with its repo owner
+(`unsloth-Model-Q4_K_M-p1`), falling back to a counter. Adding a second row
+with an identical model URL is dropped on save, since it would only ever
+produce the same entry.
+
+After **Save & Regenerate**, the **Default model** dropdown refreshes in
+place — no page reload needed.
+
 ## Exposing only the active model
 
 `/editor` has an **Expose only active model to /v1/models** checkbox. With it on,
