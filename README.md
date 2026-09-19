@@ -125,6 +125,34 @@ different policy. The override file wins over both. The active decision is shown
 in the `/editor` context line (e.g. `— yarn rope scaling x3.00 past the trained
 32768`) and in the server command under **Active server command**.
 
+## Speculative decoding / MTP loads
+
+llama.cpp's automatic memory fitting (`--fit`, on by default) probes context
+creation before the real load, and some architectures reject that probe: a
+Gemma-4 MTP assistant aborts the whole load with
+
+```
+llama_init_from_model: failed to initialize the context: Gemma4Assistant requires ctx_other to be set
+common_init_: failed to create context with model ...
+```
+
+`serve.py` already picks the context size, batch, ubatch and GPU split itself,
+so fitting has nothing left to adjust. `FIT` controls it:
+
+| value | behaviour |
+| --- | --- |
+| `auto` (default) | pass `--fit off` when MTP speculation is on, otherwise leave llama-server's default alone |
+| `on` / `off` | always pass that value |
+
+The flag is only passed when the `llama-server` binary advertises `--fit` in its
+help, so an older build is never handed an argument it would reject. Set it per
+model in **Settings** or with the `FIT` container env var.
+
+Note that llama.cpp expects the MTP assistant GGUF as the *draft* model next to
+the base model — `--model <base>` plus `--spec-draft-model <mtp-assistant>`.
+Putting the same file in both the **Model URL** and **Draft/MTP URL** fields
+logs a warning.
+
 ## Configuring the embedding model
 
 In `/editor` → **Embeddings**, choose a preset or paste any GGUF URL, then

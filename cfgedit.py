@@ -607,6 +607,7 @@ table{{width:100%;border-collapse:collapse;font-size:12px}}
 <label>MTMD_BATCH_MAX_TOKENS<br><input id=s_MTMD_BATCH_MAX_TOKENS style="width:100%;box-sizing:border-box" placeholder="1024 (raise for video)"></label>
 <label>COMPUTE_FRACTION<br><input id=s_COMPUTE_FRACTION style="width:100%;box-sizing:border-box" placeholder="0.12"></label>
 <label title="Per-model version of the Past trained context control above; /app/ctx_overflow (that control) wins over this">CTX_OVERFLOW<br><select id=s_CTX_OVERFLOW style="width:100%"><option value="">env default (clamp)</option><option value="clamp">clamp</option><option value="yarn">yarn</option><option value="linear">linear</option><option value="none">none</option></select></label>
+<label title="llama-server --fit: auto turns memory fitting off when MTP speculation is on, which some architectures (Gemma-4 MTP) need to load at all">FIT<br><select id=s_FIT style="width:100%"><option value="">env default (auto)</option><option value="auto">auto</option><option value="on">on</option><option value="off">off</option></select></label>
 </div>
 <h4 style="margin:14px 0 4px">Embeddings <small style="font-weight:normal;color:#888">(always-on sidecar on :8090 &mdash; SillyTavern vector storage)</small></h4>
 <div id=estat style="padding:6px;background:#eee;font-size:12px;margin-bottom:4px">...</div>
