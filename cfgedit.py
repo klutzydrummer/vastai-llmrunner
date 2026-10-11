@@ -909,18 +909,30 @@ function poll(){{
     var st=s.status||'idle',m=r.model,txt=st,el=document.getElementById('st');
     if(m)txt='ready — '+m;
     else if(st=='downloading')txt='downloading '+(s.pct!=null?s.pct+'% ':'')+s.model+(s.speed_mbps?' ('+s.speed_mbps.toFixed(1)+' MB/s)':'');
-    else if(st=='loading')txt='loading ctx='+s.ctx+' — '+s.model;
+    else if(st=='loading')txt='loading '+(s.n_ctx_per_slot||s.ctx)+' ctx/slot × '+(s.par||1)+' — '+s.model;
     else if(st=='retrying')txt='retrying '+s.model+' (attempt '+s.attempt+'/'+s.max_attempts+', '+s.reason+')';
     else if(st=='error'){{txt='error: '+s.error;if(s.ts&&s.ts<lastSaveTs)txt+=' — stale (before last save)';}}
     txt+=age(s.ts);
     el.style.background={{'error':'#fee','ready':'#dfd','downloading':'#e8f0fe','loading':'#e8f0fe','retrying':'#fff3cd'}}[st]||'#eee';
     el.textContent=txt;
     renderDownloads(s);
-    ctxState={{per:s.n_ctx_per_slot||0,total:s.ctx||0,train:s.n_ctx_train||0,par:s.par||1}};
+    // older status files lack ctx_train_known; there n_ctx_train is only trustworthy when it differs from the total
+    var known=s.ctx_train_known!=null?s.ctx_train_known:(s.n_ctx_train&&s.n_ctx_train!==s.ctx);
+    ctxState={{per:s.n_ctx_per_slot||0,total:s.ctx||0,train:known?(s.n_ctx_train||0):0,par:s.par||1}};
     var ci=document.getElementById('ctxinfo');
-    if(ci)ci.textContent=ctxState.per
-      ?('context: '+ctxState.per+' tokens per slot ('+ctxState.total+' total across '+ctxState.par+' slot'+(ctxState.par>1?'s':'')+(ctxState.train?', model trained for '+ctxState.train:'')+')'+(s.ctx_note?' — '+s.ctx_note:''))
-      :'context: (no model loaded)';
+    if(ci){{
+      ci.textContent='';
+      if(!ctxState.per)ci.textContent='context: (no model loaded)';
+      else{{
+        var f=function(n){{return Number(n).toLocaleString();}};
+        ci.appendChild(document.createTextNode('context per slot: '));
+        var b=document.createElement('b');
+        b.textContent=f(ctxState.per)+(ctxState.train?' / '+f(ctxState.train)+' trained max ('+Math.round(100*ctxState.per/ctxState.train)+'%)':' (trained max unknown)');
+        if(ctxState.train&&ctxState.per>ctxState.train)b.style.color='#b45309';
+        ci.appendChild(b);
+        ci.appendChild(document.createTextNode(' · '+ctxState.par+' slot'+(ctxState.par>1?'s':'')+', '+f(ctxState.total)+' total'+(s.ctx_note?' — '+s.ctx_note:'')));
+      }}
+    }}
     var cp=document.getElementById('cmdline');
     if(cp)cp.textContent=s.cmd||(st==='idle'?'(no model loaded)':'...');
     var logModel=m||(s.model||'');

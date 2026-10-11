@@ -573,14 +573,15 @@ if n_ctx_train>0 and ctx//par>n_ctx_train:
     else:
         ctx_note=f'{per} per slot past the trained {n_ctx_train}, unscaled'
     print(f'[serve] ctx overflow ({co}): {per} per slot vs trained {n_ctx_train} — {ctx_note}',flush=True)
-if n_ctx_train<=0:
+ctx_train_known=n_ctx_train>0
+if not ctx_train_known:
     n_ctx_train=ctx   # GGUF didn't say; keep reporting something sane
 batch=int(os.environ.get('BATCH_SIZE','0')) or ctx
 vram_used_mb=int(wm+pm2+ctx*kpt/1048576+compute_total/1048576)
 print(f'[serve] arch={arch} nl={nl} nkv={nkv} nh={nh} nk={nk} hd={hd} ffn={ffn}',flush=True)
 print(f'[serve] ctx={ctx} per_slot={ctx//par} batch={batch} ubatch={ub} par={par}',flush=True)
 print(f'[serve] weights={wm:.0f}MB mmproj={pm2:.0f}MB draft={pdraft:.0f}MB embed={pembed:.0f}MB kv={ctx*kpt/1048576:.0f}MB compute~{compute_total/1048576:.0f}MB',flush=True)
-write_status({'status':'loading','model':os.path.basename(mp),'ctx':ctx,'n_ctx_train':n_ctx_train,'n_ctx_per_slot':ctx//par,'vram_mb':vram_used_mb,'par':par,'port':int(PORT),'ts':int(time.time()),'ctx_overflow':co,'ctx_note':ctx_note})
+write_status({'status':'loading','model':os.path.basename(mp),'ctx':ctx,'n_ctx_train':n_ctx_train,'n_ctx_per_slot':ctx//par,'vram_mb':vram_used_mb,'par':par,'port':int(PORT),'ts':int(time.time()),'ctx_overflow':co,'ctx_note':ctx_note,'ctx_train_known':ctx_train_known})
 args=['--model',mp,'--ctx-size',str(ctx),'--batch-size',str(batch),'--ubatch-size',str(ub),'--parallel',str(par)]
 args+=['--host','0.0.0.0','--port',PORT]
 args+=['--cache-type-k',ct,'--cache-type-v',ctv]
@@ -659,7 +660,7 @@ if want_fit:
 print(f'[serve] exec {binary} {args}',flush=True)
 write_status({'status':'loading','model':os.path.basename(mp),'ctx':ctx,'n_ctx_train':n_ctx_train,
               'n_ctx_per_slot':ctx//par,'vram_mb':vram_used_mb,'par':par,'port':int(PORT),
-              'ts':int(time.time()),'ctx_overflow':co,'ctx_note':ctx_note,
+              'ts':int(time.time()),'ctx_overflow':co,'ctx_note':ctx_note,'ctx_train_known':ctx_train_known,
               'cmd':binary+' '+' '.join(args)})
 for _p in [mp]+([mmp] if mmp and os.path.isfile(mmp) else [])+([dmp] if dmp and os.path.isfile(dmp) else []):
     try: open(_p+'.pid','w').write(str(os.getpid()))
