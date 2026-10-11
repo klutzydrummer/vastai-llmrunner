@@ -95,8 +95,9 @@ env var when both are set.
 
 ## Context length
 
-The status bar in `/editor` shows the loaded model's context — tokens per slot,
-total context, slot count, and the context the model was trained for — with a
+The status bar in `/editor` leads with the loaded model's context per slot out
+of the trained maximum (e.g. `context per slot: 255,744 / 262,144 trained max
+(98%)`, amber when past it), followed by slot count and total context, with a
 **copy context length** button that copies the per-slot number, which is the
 value to put in a client's context size setting.
 
