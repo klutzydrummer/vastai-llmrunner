@@ -118,8 +118,8 @@ under 2048 tokens each.
 The **slots for <model>** slider under the status bar overrides that per
 model. It shows, as you drag it, what each slot count gives:
 
-- toward **slots ▶**: more slots, each with less context (any mode);
-- toward **◀ context**: fewer slots, each past the trained length, extended
+- left, toward **◀ slots**: more slots, each with less context (any mode);
+- right, toward **context ▶**: fewer slots, each past the trained length, extended
   with RoPE scaling — only with a `yarn`, `linear` or `none`
   [Past trained context](#going-past-the-trained-context) mode. With `clamp`
   the slider stops at the auto count.
