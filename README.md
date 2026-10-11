@@ -24,8 +24,8 @@ the same time, from the same base URL.
 
 - Custom Endpoint (Base URL): `https://<your-tunnel>/v1`
 - API key: anything non-empty
-- Pick the model from the list (`…-p1` = full context for a single user,
-  `-p2`/`-p4` split it between slots).
+- Pick the model from the list. The number of parallel slots is chosen per
+  model (see [Slots](#slots)).
 
 **Vector storage (embeddings)** — Extensions → Vector Storage:
 
@@ -38,15 +38,19 @@ produce different vector spaces and dimensions.
 
 ## Model IDs in the editor
 
-Each row in the editor's **Models** table becomes four entries in
-`config.yaml` — `<name>-p1`/`-p2`/`-p4`/`-p8` — where `<name>` comes from the
-GGUF file name in the model URL, minus the `.gguf` extension and any
-`?download=true` style query string.
+Each row in the editor's **Models** table becomes one entry in `config.yaml`
+named `<name>` (plus `<name>-nomtp` and `<name>-text` when it has an mmproj),
+where `<name>` comes from the GGUF file name in the model URL, minus the
+`.gguf` extension and any `?download=true` style query string. Ids used to
+carry a slot count (`<name>-p1` … `-p8`); a default model saved under one of
+those is pointed at the new id on the next config regen, but clients that
+saved an old id need to pick the model again, and a `DEFAULT_MODEL` container
+env var needs the `-pN` dropped.
 
 Two different models can share a file name (the same quant published by two
 repos, for example). Those names are made unique: the first model to claim a
 name keeps it, and a later one is prefixed with its repo owner
-(`unsloth-Model-Q4_K_M-p1`), falling back to a counter. Adding a second row
+(`unsloth-Model-Q4_K_M`), falling back to a counter. Adding a second row
 with an identical model URL is dropped on save, since it would only ever
 produce the same entry.
 
@@ -57,12 +61,13 @@ place — no page reload needed.
 
 `/editor` has an **Expose only active model to /v1/models** checkbox. With it on,
 `/v1/models` lists just the model that is actually loaded (or, if nothing is
-loaded, the configured default model) instead of every `-p1`/`-p2`/`-p4`/`-p8`
-variant in `config.yaml`. Clients like SillyTavern then can't pick a model that
+loaded, the configured default model) instead of every entry in
+`config.yaml`. Clients like SillyTavern then can't pick a model that
 would trigger a swap, and their model dropdown stays readable.
 
-It is off by default; the container env var `EXPOSE_ACTIVE_ONLY=1` turns it on
-at boot, and `/app/expose_active_only` (written by the UI) wins when present.
+It is on by default; the container env var `EXPOSE_ACTIVE_ONLY=0` turns it off
+at boot, and `/app/expose_active_only` (written by the UI, `1` or `0`) wins
+when present.
 The filter never hides everything: if neither a running nor a default model
 matches the listing, the full list is served as before.
 
@@ -101,17 +106,46 @@ of the trained maximum (e.g. `context per slot: 255,744 / 262,144 trained max
 **copy context length** button that copies the per-slot number, which is the
 value to put in a client's context size setting.
 
+## Slots
+
+`serve.py` sizes the total context from the VRAM left after the weights, then
+splits it into parallel slots. By default (`PARALLEL=auto`) it uses as many
+slots as can each hold the model's full trained context — e.g. ~600k tokens of
+budget on a 262k model gives 2 slots × 262,144 — and 1 slot when even one
+full-length slot doesn't fit. At most 8 slots (`MAX_SLOTS` env var), and never
+under 2048 tokens each.
+
+The **slots for <model>** slider under the status bar overrides that per
+model. It shows, as you drag it, what each slot count gives:
+
+- toward **slots ▶**: more slots, each with less context (any mode);
+- toward **◀ context**: fewer slots, each past the trained length, extended
+  with RoPE scaling — only with a `yarn`, `linear` or `none`
+  [Past trained context](#going-past-the-trained-context) mode. With `clamp`
+  the slider stops at the auto count.
+
+With `clamp`, budget beyond the auto slots' trained length goes unused. With
+the other modes every slot count uses the whole budget, so at auto the
+remainder is spread across the slots and extended too (1 slot × 511,488 at
+1.95× yarn on a 262k model with ~511k of budget).
+
+**Apply** saves the count in `/app/slots/<model id>` and reloads the model if
+it is the one running; **Auto** removes it. The options come from the budget
+the model recorded on its last load (`/app/ctx_budget/<model id>.json`), so a
+model has to load once before the slider appears. A count the budget no longer
+allows (e.g. after a KV cache quant change) is clamped into range on load.
+
 ### Going past the trained context
 
 The context is sized from whatever VRAM is left after the weights, so a slot can
 end up with more context than the model was actually trained for — which makes
 llama-server refuse to load, or produce gibberish past the trained length. The
 **Past trained context** dropdown in `/editor` picks what happens when the
-per-slot context (`ctx / parallel`) exceeds the GGUF's `context_length`:
+per-slot context (budget / slots) exceeds the GGUF's `context_length`:
 
 | mode | behaviour |
 | --- | --- |
-| `clamp` (default) | ceiling the context at the trained length — safest, no quality loss |
+| `clamp` (default) | ceiling the context at the trained length — safest, no quality loss; any budget past the auto slots' trained length goes unused |
 | `yarn` | keep the larger context and extend it with YaRN RoPE scaling (`--rope-scaling yarn --rope-scale <factor> --yarn-orig-ctx <trained>`) |
 | `linear` | same, with linear RoPE scaling |
 | `none` | keep the larger context with no scaling — llama-server's own behaviour, which is what used to crash |

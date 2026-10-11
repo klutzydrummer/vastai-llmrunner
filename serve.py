@@ -506,7 +506,7 @@ _ct_override='/app/cache_type'
 if os.path.isfile(_ct_override):
     _v=open(_ct_override).read().strip()
     if _v: ct=ctv=_v
-par=int(os.environ.get('PARALLEL','1'));cf=float(os.environ.get('COMPUTE_FRACTION','0.12'))
+cf=float(os.environ.get('COMPUTE_FRACTION','0.12'))
 eb={'f16':2.0,'q8_0':1.0625,'q4_0':0.5,'q4_1':0.5625,'f32':4.0,'q5_0':0.625,'q5_1':0.6875}.get(ct,2.0)
 wm=os.path.getsize(mp)/1048576*1.05
 pm2=os.path.getsize(mmp)/1048576*1.02 if mmp and os.path.isfile(mmp) else 0
@@ -532,7 +532,9 @@ else:
     ub=512
 kpt=2*nkv*nk*hd*eb;compute_total=ndev*max(nh*ub*ub*4,2*ffn*ub*4)*SAFETY
 kv_bytes=max(0,rem)-compute_total
-ctx=int(os.environ.get('CTX_SIZE','0')) or max(512*par,max(0,(int(kv_bytes/kpt)//512)*512))
+# Total context the VRAM budget holds across all slots; how it is split into
+# slots is decided further down, once the trained context is known.
+ctx_budget=int(os.environ.get('CTX_SIZE','0')) or max(512,max(0,(int(kv_bytes/kpt)//512)*512))
 ub=int(os.environ.get('UBATCH_SIZE','0')) or ub
 # Vision models: non-causal attention requires ubatch >= image token count
 if mmp and os.path.isfile(mmp):
@@ -541,9 +543,10 @@ if mmp and os.path.isfile(mmp):
 # ── context vs. trained context ───────────────────────────────────────────────
 # The KV budget above can hand a slot more context than the model was trained
 # for; llama-server then either refuses to load or generates gibberish past the
-# trained length. CTX_OVERFLOW picks what happens, comparing the PER-SLOT
-# context (ctx//par) against the GGUF's context_length:
-#   clamp  — ceiling the context at the trained length (default)
+# trained length. CTX_OVERFLOW picks what happens when a slot's share of the
+# budget (ctx_budget//slots) exceeds the GGUF's context_length:
+#   clamp  — ceiling the context at the trained length (default); the slot
+#            slider can't go below the auto slot count
 #   yarn   — keep the larger context, extend it with YaRN RoPE scaling
 #   linear — keep the larger context, extend it with linear RoPE scaling
 #   none   — keep the larger context, no scaling (llama-server's own behaviour)
@@ -558,22 +561,60 @@ if os.path.isfile(CTX_OVERFLOW_FILE):
 if co not in CTX_OVERFLOW_MODES:
     if co: print(f'[serve] warn: unknown CTX_OVERFLOW={co!r}, using clamp',flush=True)
     co='clamp'
-rope_args=[];ctx_note=''
+# ── slots ─────────────────────────────────────────────────────────────────────
+# PARALLEL=auto (what cfginit writes) fills the budget with as many slots as
+# can each hold the full trained context. The editor's slot slider stores a
+# per-model count in /app/slots/<model id>, which wins over auto and over a
+# numeric PARALLEL. cfgedit.py mirrors plan_slots() in JS for the slider, so
+# keep the two in step.
+MODEL_ID=os.environ.get('MODEL_ID','') or os.path.basename(mp).rsplit('.gguf',1)[0]
+SLOTS_DIR='/app/slots';CTX_BUDGET_DIR='/app/ctx_budget'
+MAX_SLOTS=_int_setting('MAX_SLOTS',8,1,64)
+MIN_SLOT_CTX=2048
+def model_file(d,mid): return os.path.join(d,''.join(c if c.isalnum() or c in '._-' else '_' for c in mid))
+def plan_slots(budget,train,mode,want=0):
+    """(slots, per-slot ctx, min, max, auto) for a total budget. Fewer slots
+    than auto would push each slot past the trained length, so clamp only
+    allows auto and up; the extension modes allow down to 1."""
+    smax=max(1,min(MAX_SLOTS,budget//MIN_SLOT_CTX))
+    sauto=max(1,min(smax,budget//train)) if train>0 else 1
+    smin=sauto if (mode=='clamp' and train>0) else 1
+    n=max(smin,min(smax,want)) if want>0 else sauto
+    per=(budget//n//256)*256 or budget//n
+    if mode=='clamp' and train>0: per=min(per,train)
+    return n,per,smin,smax,sauto
+want=0;slots_src='auto'
+_raw_par=os.environ.get('PARALLEL','auto').strip().lower()
+if _raw_par.isdigit() and int(_raw_par)>0: want=int(_raw_par);slots_src='PARALLEL'
+try:
+    _v=open(model_file(SLOTS_DIR,MODEL_ID)).read().strip()
+    if _v.isdigit() and int(_v)>0: want=int(_v);slots_src='slider'
+except OSError: pass
 n_ctx_train=scalar(P('context_length',0))
-if n_ctx_train>0 and ctx//par>n_ctx_train:
-    per=ctx//par
-    if co=='clamp':
-        ctx=n_ctx_train*par
-        ctx_note=f'clamped to the trained {n_ctx_train} per slot'
-    elif co in ('yarn','linear'):
-        factor=per/n_ctx_train
+ctx_train_known=n_ctx_train>0
+par,per,slots_min,slots_max,slots_auto=plan_slots(ctx_budget,n_ctx_train,co,want)
+if want and par!=want: print(f'[serve] warn: {slots_src} asked for {want} slots, allowed {slots_min}-{slots_max} — using {par}',flush=True)
+if slots_src!='auto' and par==slots_auto: slots_src+=' (= auto)'
+ctx=per*par
+try:
+    os.makedirs(CTX_BUDGET_DIR,exist_ok=True)
+    open(model_file(CTX_BUDGET_DIR,MODEL_ID)+'.json','w').write(json.dumps(
+        {'model_id':MODEL_ID,'ctx_budget':ctx_budget,'n_ctx_train':n_ctx_train if ctx_train_known else 0,
+         'max_slots':MAX_SLOTS,'min_slot_ctx':MIN_SLOT_CTX,'ts':int(time.time())}))
+except OSError as e: print(f'[serve] warn: could not save ctx budget: {e}',flush=True)
+rope_args=[];ctx_note=''
+if ctx_train_known and per>n_ctx_train:
+    factor=per/n_ctx_train
+    if co in ('yarn','linear'):
         rope_args=['--rope-scaling',co,'--rope-scale',f'{factor:.4f}']
         if co=='yarn': rope_args+=['--yarn-orig-ctx',str(n_ctx_train)]
         ctx_note=f'{co} rope scaling x{factor:.2f} past the trained {n_ctx_train}'
     else:
         ctx_note=f'{per} per slot past the trained {n_ctx_train}, unscaled'
-    print(f'[serve] ctx overflow ({co}): {per} per slot vs trained {n_ctx_train} — {ctx_note}',flush=True)
-ctx_train_known=n_ctx_train>0
+elif ctx_train_known and co=='clamp' and par==slots_auto and ctx_budget//par>n_ctx_train:
+    ctx_note=f'clamped to the trained {n_ctx_train} per slot'
+print(f'[serve] slots: {par} ({slots_src}; auto={slots_auto}, range {slots_min}-{slots_max}) x {per} of budget {ctx_budget}'
+      +(f' — {ctx_note}' if ctx_note else ''),flush=True)
 if not ctx_train_known:
     n_ctx_train=ctx   # GGUF didn't say; keep reporting something sane
 batch=int(os.environ.get('BATCH_SIZE','0')) or ctx
@@ -581,7 +622,7 @@ vram_used_mb=int(wm+pm2+ctx*kpt/1048576+compute_total/1048576)
 print(f'[serve] arch={arch} nl={nl} nkv={nkv} nh={nh} nk={nk} hd={hd} ffn={ffn}',flush=True)
 print(f'[serve] ctx={ctx} per_slot={ctx//par} batch={batch} ubatch={ub} par={par}',flush=True)
 print(f'[serve] weights={wm:.0f}MB mmproj={pm2:.0f}MB draft={pdraft:.0f}MB embed={pembed:.0f}MB kv={ctx*kpt/1048576:.0f}MB compute~{compute_total/1048576:.0f}MB',flush=True)
-write_status({'status':'loading','model':os.path.basename(mp),'ctx':ctx,'n_ctx_train':n_ctx_train,'n_ctx_per_slot':ctx//par,'vram_mb':vram_used_mb,'par':par,'port':int(PORT),'ts':int(time.time()),'ctx_overflow':co,'ctx_note':ctx_note,'ctx_train_known':ctx_train_known})
+write_status({'status':'loading','model':os.path.basename(mp),'ctx':ctx,'n_ctx_train':n_ctx_train,'n_ctx_per_slot':ctx//par,'vram_mb':vram_used_mb,'par':par,'port':int(PORT),'ts':int(time.time()),'ctx_overflow':co,'ctx_note':ctx_note,'ctx_train_known':ctx_train_known,'model_id':MODEL_ID,'ctx_budget':ctx_budget,'slots_auto':slots_auto,'slots_min':slots_min,'slots_max':slots_max,'slots_src':slots_src})
 args=['--model',mp,'--ctx-size',str(ctx),'--batch-size',str(batch),'--ubatch-size',str(ub),'--parallel',str(par)]
 args+=['--host','0.0.0.0','--port',PORT]
 args+=['--cache-type-k',ct,'--cache-type-v',ctv]
@@ -660,7 +701,7 @@ if want_fit:
 print(f'[serve] exec {binary} {args}',flush=True)
 write_status({'status':'loading','model':os.path.basename(mp),'ctx':ctx,'n_ctx_train':n_ctx_train,
               'n_ctx_per_slot':ctx//par,'vram_mb':vram_used_mb,'par':par,'port':int(PORT),
-              'ts':int(time.time()),'ctx_overflow':co,'ctx_note':ctx_note,'ctx_train_known':ctx_train_known,
+              'ts':int(time.time()),'ctx_overflow':co,'ctx_note':ctx_note,'ctx_train_known':ctx_train_known,'model_id':MODEL_ID,'ctx_budget':ctx_budget,'slots_auto':slots_auto,'slots_min':slots_min,'slots_max':slots_max,'slots_src':slots_src,
               'cmd':binary+' '+' '.join(args)})
 for _p in [mp]+([mmp] if mmp and os.path.isfile(mmp) else [])+([dmp] if dmp and os.path.isfile(dmp) else []):
     try: open(_p+'.pid','w').write(str(os.getpid()))

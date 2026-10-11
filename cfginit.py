@@ -132,36 +132,38 @@ def build_config(params):
             variants.append(('-nomtp', True, False, True))   # mmproj, no draft, spec disabled
             variants.append(('-text', False, True, False))   # no mmproj, draft only
         for sfxv, use_mm, use_dm, no_mtp in variants:
-            for par in [1, 2, 4, 8]:
-                mid = f"{MN}-p{par}{sfxv}"
-                # Stems are unique, but a stem that already ends in a variant
-                # suffix could still collide; a duplicate YAML key would drop a
-                # model from /v1/models silently, so keep every id distinct.
-                if mid in emitted:
-                    n = 2
-                    while f"{mid}-{n}" in emitted:
-                        n += 1
-                    mid = f"{mid}-{n}"
-                emitted.add(mid)
-                lines.append(f"  {mid!r}:")
-                lines.append(f'    proxy: "http://127.0.0.1:${{PORT}}"')
-                lines.append(f"    env:")
-                lines.append(f'      - "MODEL_URL={MU}"')
-                # Always set MMPROJ_URL/DRAFT_MODEL_URL explicitly (even blank) so the
-                # spawned serve.py subprocess never falls back to inheriting the
-                # container's unsuffixed (model 1) env vars for models that don't
-                # define their own mmproj/draft model.
-                lines.append(f'      - "MMPROJ_URL={MMU if use_mm else ""}"')
-                lines.append(f'      - "DRAFT_MODEL_URL={DMU if use_dm else ""}"')
-                if no_mtp:
-                    lines.append(f'      - "NO_MTP=1"')
-                for k in PASS_KEYS:
-                    v = params.get("settings", {}).get(k)
-                    if v:
-                        lines.append(f'      - "{k}={v}"')
-                lines.append(f'      - "PARALLEL={par}"')
-                lines.append(f"    cmd: python3 /tmp/serve.py ${{PORT}}")
-                lines.append(f"    logFile: /tmp/serve-{mid}.log")
+            # One entry per variant: serve.py picks the slot count itself
+            # (PARALLEL=auto), and the editor's slot slider overrides it per model.
+            mid = f"{MN}{sfxv}"
+            # Stems are unique, but a stem that already ends in a variant
+            # suffix could still collide; a duplicate YAML key would drop a
+            # model from /v1/models silently, so keep every id distinct.
+            if mid in emitted:
+                n = 2
+                while f"{mid}-{n}" in emitted:
+                    n += 1
+                mid = f"{mid}-{n}"
+            emitted.add(mid)
+            lines.append(f"  {mid!r}:")
+            lines.append(f'    proxy: "http://127.0.0.1:${{PORT}}"')
+            lines.append(f"    env:")
+            lines.append(f'      - "MODEL_URL={MU}"')
+            # Always set MMPROJ_URL/DRAFT_MODEL_URL explicitly (even blank) so the
+            # spawned serve.py subprocess never falls back to inheriting the
+            # container's unsuffixed (model 1) env vars for models that don't
+            # define their own mmproj/draft model.
+            lines.append(f'      - "MMPROJ_URL={MMU if use_mm else ""}"')
+            lines.append(f'      - "DRAFT_MODEL_URL={DMU if use_dm else ""}"')
+            if no_mtp:
+                lines.append(f'      - "NO_MTP=1"')
+            for k in PASS_KEYS:
+                v = params.get("settings", {}).get(k)
+                if v:
+                    lines.append(f'      - "{k}={v}"')
+            lines.append(f'      - "PARALLEL=auto"')
+            lines.append(f'      - "MODEL_ID={mid}"')
+            lines.append(f"    cmd: python3 /tmp/serve.py ${{PORT}}")
+            lines.append(f"    logFile: /tmp/serve-{mid}.log")
     return "\n".join(lines) + "\n", found
 
 def write_config(cfg, path="/app/config.yaml"):
@@ -174,10 +176,26 @@ def write_config(cfg, path="/app/config.yaml"):
         os.fsync(f.fileno())
     os.replace(tmp, path)
 
+DEFAULT_MODEL_FILE = "/app/default_model"
+
+def migrate_default_model(cfg):
+    """Model ids used to carry a slot count (<name>-p1, <name>-p2-text, ...).
+    Point a default model saved under such an id at the id that replaced it."""
+    try:
+        cur = open(DEFAULT_MODEL_FILE).read().strip()
+    except OSError:
+        return
+    ids = set(re.findall(r"^  '(.*)':$", cfg, re.M))
+    new = re.sub(r"-p[1248](?=(-nomtp|-text)?$)", "", cur)
+    if cur and cur not in ids and new in ids:
+        open(DEFAULT_MODEL_FILE, "w").write(new)
+        print(f"[init] default model {cur!r} -> {new!r}", flush=True)
+
 def main():
     params = load_params()
     cfg, found = build_config(params)
     write_config(cfg)
+    migrate_default_model(cfg)
     print(f"[init] wrote /app/config.yaml with {found} model(s)", flush=True)
 
 if __name__ == "__main__":

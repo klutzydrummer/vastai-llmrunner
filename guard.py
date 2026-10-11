@@ -29,7 +29,8 @@ def expose_active_only():
         v=open(EXPOSE_ACTIVE_ONLY_FILE).read().strip()
         if v: return v.lower() in TRUTHY
     except: pass
-    return os.environ.get('EXPOSE_ACTIVE_ONLY','').strip().lower() in TRUTHY
+    # on unless EXPOSE_ACTIVE_ONLY is set to something falsy
+    return (os.environ.get('EXPOSE_ACTIVE_ONLY','').strip().lower() or '1') in TRUTHY
 
 def filter_models(raw,active):
     """Keep only the active model in an OpenAI /v1/models listing.
