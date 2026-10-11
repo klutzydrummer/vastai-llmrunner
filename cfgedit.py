@@ -18,11 +18,17 @@ CTX_OVERFLOW_MODES=['clamp','yarn','linear','none']
 # Download tuning, applied by serve.py without a config regen (same override-file
 # pattern as /app/downloader): connections aria2c opens per file, and how many
 # files (model + mmproj + draft) are fetched at the same time.
+# Per-model slot counts: /app/slots/<model id> holds the count picked with the
+# editor's slot slider (absent = auto), and serve.py records each model's VRAM
+# context budget in /app/ctx_budget/<model id>.json so the slider can show
+# every split before the model is reloaded.
+SLOTS_DIR='/app/slots'
+CTX_BUDGET_DIR='/app/ctx_budget'
 DL_CONNECTIONS_FILE='/app/download_connections'
 DL_PARALLEL_FILE='/app/download_parallel'
 DL_CONNECTIONS_DEFAULT=16
 DL_PARALLEL_DEFAULT=1
-# When set, guard.py trims /v1/models down to the active model only, so API
+# On by default: guard.py trims /v1/models down to the active model only, so API
 # clients see a single entry instead of every variant in config.yaml.
 EXPOSE_ACTIVE_ONLY_FILE='/app/expose_active_only'
 TRUTHY={'1','true','yes','on'}
@@ -65,6 +71,31 @@ def write_override(path,value):
     if v: open(path,'w').write(v)
     elif os.path.exists(path): os.remove(path)
     return v
+
+def model_file(d,mid):
+    # same sanitising as serve.py's model_file()
+    return os.path.join(d,''.join(c if c.isalnum() or c in '._-' else '_' for c in mid))
+
+def effective_ctx_overflow():
+    """The CTX_OVERFLOW mode serve.py will use on the next load: the editor's
+    override file, then the saved settings, then the env, then clamp."""
+    v=read_override(CTX_OVERFLOW_FILE)
+    if not v:
+        try: v=(cfginit.load_params().get('settings',{}).get('CTX_OVERFLOW') or '').strip()
+        except Exception: v=''
+    v=(v or os.environ.get('CTX_OVERFLOW','')).strip().lower()
+    return v if v in CTX_OVERFLOW_MODES else 'clamp'
+
+def slot_plan(mid):
+    """What the slot slider needs for one model: its recorded budget (empty
+    until it has loaded once), the saved slot count (0 = auto) and the mode."""
+    plan={'model_id':mid,'mode':effective_ctx_overflow(),'slots':0}
+    try: plan.update(json.loads(open(model_file(CTX_BUDGET_DIR,mid)+'.json').read()))
+    except (OSError,ValueError): pass
+    v=read_override(model_file(SLOTS_DIR,mid))
+    if v.isdigit(): plan['slots']=int(v)
+    plan['model_id']=mid
+    return plan
 
 def write_update_result(d):
     try: open(UPDATE_RESULT,'w').write(json.dumps(d))
@@ -231,7 +262,8 @@ def expose_active_only():
         v=open(EXPOSE_ACTIVE_ONLY_FILE).read().strip()
         if v: return v.lower() in TRUTHY
     except: pass
-    return os.environ.get('EXPOSE_ACTIVE_ONLY','').strip().lower() in TRUTHY
+    # on unless EXPOSE_ACTIVE_ONLY is set to something falsy
+    return (os.environ.get('EXPOSE_ACTIVE_ONLY','').strip().lower() or '1') in TRUTHY
 
 def get_running():
     s,d=llama_swap('GET','/running')
@@ -342,6 +374,9 @@ class H(BaseHTTPRequestHandler):
             self.ok(read_override(CTX_OVERFLOW_FILE,'env default').encode())
         elif self.path=='/expose_active_only':
             self.ok(json.dumps({'enabled':expose_active_only()}).encode(),'application/json')
+        elif self.path.startswith('/slot_plan'):
+            mid=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get('model',[''])[0].strip()
+            self.ok(json.dumps(slot_plan(mid) if mid else {}).encode(),'application/json')
         elif self.path=='/': self._ui()
         elif self.path=='/debug': self._debug_ui()
         elif self.path.startswith('/logfile'):
@@ -393,8 +428,8 @@ class H(BaseHTTPRequestHandler):
             print(f'[cfgedit] default_model: {v or "cleared"}',flush=True);self.ok(b'OK\n')
         elif self.path=='/expose_active_only':
             v=body.decode().strip().lower() in TRUTHY
-            if v: open(EXPOSE_ACTIVE_ONLY_FILE,'w').write('1')
-            elif os.path.exists(EXPOSE_ACTIVE_ONLY_FILE): os.remove(EXPOSE_ACTIVE_ONLY_FILE)
+            # write '0' too: with the default on, removing the file would turn it back on
+            open(EXPOSE_ACTIVE_ONLY_FILE,'w').write('1' if v else '0')
             print(f'[cfgedit] expose_active_only: {v}',flush=True);self.ok(b'OK\n')
         elif self.path=='/download_opts':
             self.ok(json.dumps({'connections':read_override(DL_CONNECTIONS_FILE),
@@ -416,6 +451,23 @@ class H(BaseHTTPRequestHandler):
             v=write_override(CTX_OVERFLOW_FILE,v)
             unload_all()
             print(f'[cfgedit] ctx_overflow: {v or "cleared"}',flush=True);self.ok(b'OK\n')
+        elif self.path=='/slots':
+            # {"model": id, "slots": n} saves a count for that model; 0 or empty
+            # goes back to auto. A running model is reloaded so it applies now.
+            try:
+                req=json.loads(body.decode() or '{}')
+                mid=(req.get('model') or '').strip()
+                n=int(req.get('slots') or 0)
+                if not mid or n<0: raise ValueError('need a model and slots >= 0')
+            except (ValueError,TypeError) as e:
+                self.send_response(400);self.end_headers();self.wfile.write(str(e).encode());return
+            os.makedirs(SLOTS_DIR,exist_ok=True)
+            write_override(model_file(SLOTS_DIR,mid),str(n) if n else '')
+            running=get_running()==mid
+            unload_all()
+            if running: threading.Thread(target=_preload,args=(mid,),daemon=True).start()
+            print(f'[cfgedit] slots {mid}: {n or "auto"}{" (reloading)" if running else ""}',flush=True)
+            self.ok(json.dumps({'reloading':running}).encode(),'application/json')
         elif self.path=='/load':
             v=body.decode().strip()
             if v:
@@ -484,8 +536,8 @@ class H(BaseHTTPRequestHandler):
         cur_co=read_override(CTX_OVERFLOW_FILE)
         co_labels={'clamp':'clamp — cap at trained length (default)',
                    'yarn':'yarn — RoPE scale past trained length',
-                   'linear':'linear — RoPE scale past trained length',
-                   'none':'none — go past unscaled'}
+                   'linear':'linear — capped by llama-server, same as clamp',
+                   'none':'none — capped by llama-server, same as clamp'}
         co_opts=f'<option value="" {"selected" if not cur_co else ""}>env default</option>'
         co_opts+=''.join(f'<option value="{m}" {"selected" if cur_co==m else ""}>{co_labels[m]}</option>'
                          for m in CTX_OVERFLOW_MODES)
@@ -556,6 +608,7 @@ table{{width:100%;border-collapse:collapse;font-size:12px}}
 <div class=strow style="display:flex;align-items:flex-start;gap:4px"><div id=st style="flex:1">...</div><button onclick="navigator.clipboard.writeText(document.getElementById('st').textContent)" style="padding:2px 7px;font-size:11px;font-family:monospace;flex-shrink:0">copy</button></div>
 <div id=dlwrap class=strow></div>
 <div class=strow style="display:flex;align-items:center;gap:6px;flex-wrap:wrap"><span id=ctxinfo style="font-size:12px;color:#555">context: (no model loaded)</span><button id=ctxbtn onclick="copyCtx()" style="padding:2px 7px;font-size:11px;font-family:monospace">copy context length</button></div>
+<div id=slotbox class=strow style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px;color:#555"><span id=slotmodel>slots: (no model)</span><span id=slotctl style="display:none;align-items:center;gap:6px;flex-wrap:wrap"><span title="more slots, less context each">&#9664; slots</span><input type=range id=slotr min=1 max=1 step=1 oninput="slotMoved()" style="width:180px;direction:rtl"><span title="fewer slots, more context each">context &#9654;</span><b id=slotlbl></b><button id=slotapply onclick="applySlots(+document.getElementById('slotr').value)" style="padding:2px 7px;font-size:11px" disabled>Apply</button><button id=slotauto onclick="applySlots(0)" style="padding:2px 7px;font-size:11px">Auto</button><span id=slothint style="color:#888"></span></span></div>
 <details id=cd style="margin:2px 0 4px"><summary style="cursor:pointer;user-select:none;font-size:12px;color:#555">&#9658; Active server command <button id=cpycmd onclick="event.preventDefault();var t=document.getElementById('cmdline').textContent;navigator.clipboard.writeText(t).then(function(){{var b=document.getElementById('cpycmd');b.textContent='copied!';setTimeout(function(){{b.textContent='copy';}},2000);}});" style="padding:1px 6px;font-size:11px;font-family:monospace">copy</button></summary><pre id=cmdline style="background:#111;color:#aaa;padding:6px;margin:2px 0;font-size:11px;white-space:pre-wrap;word-break:break-all">(no model loaded)</pre></details>
 <div class=bar>
 <label>Default model: <select id=dm onchange="setDM(this.value)">{dm_opts}</select></label>
@@ -587,7 +640,7 @@ table{{width:100%;border-collapse:collapse;font-size:12px}}
 <label class=chk title="Hide every other model from /v1/models so API clients only ever see the model that is loaded"><input type=checkbox id=eao {"checked" if cur_eao else ""} onchange="setEAO(this.checked)"> Expose only active model to /v1/models</label>
 <span id=msg style="font-size:12px;color:#888"></span>
 </div>
-<small>p1=max ctx single user | p2/p4=split ctx | p8=may OOM on single GPU</small><br>
+<small>Slots are picked per model: as many as fit at the full trained context, or set with the slot slider above</small><br>
 <h4 style="margin:10px 0 4px">Models</h4>
 <table id=mtbl>
 <thead><tr style="text-align:left"><th style="width:34%">Model URL</th><th style="width:33%">MMPROJ URL (optional)</th><th style="width:30%">Draft/MTP URL (optional)</th><th></th></tr></thead>
@@ -671,6 +724,55 @@ function copyCtx(){{
   }}).catch(function(){{
     b.textContent='copy failed';setTimeout(function(){{b.textContent='copy context length';}},2000);
   }});
+}}
+// Mirrors plan_slots() in serve.py — keep the two in step.
+function planSlots(p,want){{
+  var b=p.ctx_budget,t=p.n_ctx_train||0,mx=Math.max(1,Math.min(p.max_slots||8,Math.floor(b/(p.min_slot_ctx||2048))));
+  var auto=t>0?Math.max(1,Math.min(mx,Math.floor(b/t))):1,capped=p.mode!='yarn'&&t>0,mn=capped?auto:1;
+  var n=want>0?Math.max(mn,Math.min(mx,want)):auto;
+  var per=Math.floor(Math.floor(b/n)/256)*256||Math.floor(b/n);
+  if(capped)per=Math.min(per,t);
+  return {{n:n,per:per,min:mn,max:mx,auto:auto,train:t}};
+}}
+var slotPlan=null,slotPlanKey='',slotDirty=false;
+function slotLabel(v){{
+  var q=planSlots(slotPlan,v),f=function(n){{return Number(n).toLocaleString();}};
+  var t=q.n+' slot'+(q.n>1?'s':'')+' × '+f(q.per);
+  if(q.train){{
+    if(q.per>q.train)t+=' — '+(q.per/q.train).toFixed(2)+'× yarn scaling';
+    else if(q.per<q.train)t+=' — '+Math.round(100*q.per/q.train)+'% of trained';
+    else t+=' — trained length';
+  }}
+  var tags=[];if(q.n==q.auto)tags.push('auto');if(q.n==planSlots(slotPlan,slotPlan.slots).n)tags.push('current');
+  return t+(tags.length?' ('+tags.join(', ')+')':'');
+}}
+function renderSlots(p){{
+  var key=JSON.stringify(p);if(key===slotPlanKey)return;slotPlanKey=key;
+  var mm=document.getElementById('slotmodel'),ctl=document.getElementById('slotctl');
+  if(!p||!p.model_id){{slotPlan=null;mm.textContent='slots: (no model)';ctl.style.display='none';return;}}
+  if(!p.ctx_budget){{slotPlan=null;mm.textContent='slots for '+p.model_id+': load the model once to see the options';ctl.style.display='none';return;}}
+  if(!slotPlan||slotPlan.model_id!==p.model_id)slotDirty=false;
+  slotPlan=p;var q=planSlots(p,p.slots),r=document.getElementById('slotr');
+  mm.textContent='slots for '+p.model_id+(p.slots?'':' (auto)')+':';
+  r.min=q.min;r.max=q.max;r.disabled=q.min==q.max;
+  if(!slotDirty)r.value=q.n;
+  document.getElementById('slothint').textContent=(p.mode!='yarn'&&q.train&&p.ctx_budget>q.auto*q.train)
+    ?'set Past trained context to yarn to go past '+Number(q.train).toLocaleString()+' per slot':'';
+  ctl.style.display='inline-flex';slotMoved(true);
+}}
+function slotMoved(fromRender){{
+  if(!slotPlan)return;var v=+document.getElementById('slotr').value;
+  if(fromRender!==true)slotDirty=true;
+  document.getElementById('slotlbl').textContent=slotLabel(v);
+  document.getElementById('slotapply').disabled=v==planSlots(slotPlan,slotPlan.slots).n;
+  document.getElementById('slotauto').disabled=!slotPlan.slots;
+}}
+function applySlots(v){{
+  if(!slotPlan)return;var mid=slotPlan.model_id;M.textContent='applying...';
+  fetch(E+'/slots',{{method:'POST',body:JSON.stringify({{model:mid,slots:v}})}}).then(r=>r.ok?r.json():Promise.reject(r.status)).then(function(j){{
+    slotDirty=false;slotPlanKey='';
+    M.textContent='✓ '+mid+': '+(v?v+' slot'+(v>1?'s':''):'auto slots')+(j.reloading?' — reloading':' (applies on next load)');
+  }}).catch(e=>M.textContent='✗ '+e);
 }}
 function setCO(v){{M.textContent='applying...';fetch(E+'/ctx_overflow',{{method:'POST',body:v}}).then(r=>M.textContent=r.ok?'✓ past-trained-context behavior set (unloaded — reload to apply)':'✗ '+r.status)}}
 function setCT(v){{M.textContent='applying...';fetch(E+'/cache_type',{{method:'POST',body:v}}).then(r=>M.textContent=r.ok?'✓ kv cache quant set (unloaded — reload to apply)':'✗ '+r.status)}}
@@ -930,9 +1032,12 @@ function poll(){{
         b.textContent=f(ctxState.per)+(ctxState.train?' / '+f(ctxState.train)+' trained max ('+Math.round(100*ctxState.per/ctxState.train)+'%)':' (trained max unknown)');
         if(ctxState.train&&ctxState.per>ctxState.train)b.style.color='#b45309';
         ci.appendChild(b);
-        ci.appendChild(document.createTextNode(' · '+ctxState.par+' slot'+(ctxState.par>1?'s':'')+', '+f(ctxState.total)+' total'+(s.ctx_note?' — '+s.ctx_note:'')));
+        ci.appendChild(document.createTextNode(' · '+ctxState.par+' slot'+(ctxState.par>1?'s':'')+(s.slots_src?' ('+s.slots_src+')':'')+', '+f(ctxState.total)+' total'+(s.ctx_note?' — '+s.ctx_note:'')));
       }}
     }}
+    var sid=m||s.model_id||(document.getElementById('dm')||{{}}).value||'';
+    if(sid)fetch(E+'/slot_plan?model='+encodeURIComponent(sid),{{cache:'no-store'}}).then(r=>r.json()).then(renderSlots).catch(()=>{{}});
+    else renderSlots(null);
     var cp=document.getElementById('cmdline');
     if(cp)cp.textContent=s.cmd||(st==='idle'?'(no model loaded)':'...');
     var logModel=m||(s.model||'');
