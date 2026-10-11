@@ -106,6 +106,19 @@ of the trained maximum (e.g. `context per slot: 255,744 / 262,144 trained max
 **copy context length** button that copies the per-slot number, which is the
 value to put in a client's context size setting.
 
+## VRAM detection
+
+The context budget starts from the GPUs' total memory. `serve.py` asks
+`nvidia-smi` first; some hosts ship a broken one (a wrapper whose
+`nvidia-smi.real` is missing), so it falls back to NVML (`libnvidia-ml`, part of
+the driver) and then to `llama-server --list-devices`. The log line
+`[serve] detected N GPU(s) via <source>` says which one answered.
+
+If none of them work, the budget drops to the 512-token floor and the context
+line says `no GPU memory detected`. Set `VRAM_MB` in the container env — one
+number for the total (`131072`) or one per GPU (`65536,65536`) — to skip
+detection, or `CTX_SIZE` to fix the total context outright.
+
 ## Slots
 
 `serve.py` sizes the total context from the VRAM left after the weights, then
