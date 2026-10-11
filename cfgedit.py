@@ -536,8 +536,8 @@ class H(BaseHTTPRequestHandler):
         cur_co=read_override(CTX_OVERFLOW_FILE)
         co_labels={'clamp':'clamp — cap at trained length (default)',
                    'yarn':'yarn — RoPE scale past trained length',
-                   'linear':'linear — RoPE scale past trained length',
-                   'none':'none — go past unscaled'}
+                   'linear':'linear — capped by llama-server, same as clamp',
+                   'none':'none — capped by llama-server, same as clamp'}
         co_opts=f'<option value="" {"selected" if not cur_co else ""}>env default</option>'
         co_opts+=''.join(f'<option value="{m}" {"selected" if cur_co==m else ""}>{co_labels[m]}</option>'
                          for m in CTX_OVERFLOW_MODES)
@@ -608,7 +608,7 @@ table{{width:100%;border-collapse:collapse;font-size:12px}}
 <div class=strow style="display:flex;align-items:flex-start;gap:4px"><div id=st style="flex:1">...</div><button onclick="navigator.clipboard.writeText(document.getElementById('st').textContent)" style="padding:2px 7px;font-size:11px;font-family:monospace;flex-shrink:0">copy</button></div>
 <div id=dlwrap class=strow></div>
 <div class=strow style="display:flex;align-items:center;gap:6px;flex-wrap:wrap"><span id=ctxinfo style="font-size:12px;color:#555">context: (no model loaded)</span><button id=ctxbtn onclick="copyCtx()" style="padding:2px 7px;font-size:11px;font-family:monospace">copy context length</button></div>
-<div id=slotbox class=strow style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px;color:#555"><span id=slotmodel>slots: (no model)</span><span id=slotctl style="display:none;align-items:center;gap:6px;flex-wrap:wrap"><span title="more slots, less context each">&#9664; slots</span><input type=range id=slotr min=1 max=1 step=1 oninput="slotMoved()" style="width:180px;direction:rtl"><span title="fewer slots, more context each">context &#9654;</span><b id=slotlbl></b><button id=slotapply onclick="applySlots(+document.getElementById('slotr').value)" style="padding:2px 7px;font-size:11px" disabled>Apply</button><button id=slotauto onclick="applySlots(0)" style="padding:2px 7px;font-size:11px">Auto</button></span></div>
+<div id=slotbox class=strow style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px;color:#555"><span id=slotmodel>slots: (no model)</span><span id=slotctl style="display:none;align-items:center;gap:6px;flex-wrap:wrap"><span title="more slots, less context each">&#9664; slots</span><input type=range id=slotr min=1 max=1 step=1 oninput="slotMoved()" style="width:180px;direction:rtl"><span title="fewer slots, more context each">context &#9654;</span><b id=slotlbl></b><button id=slotapply onclick="applySlots(+document.getElementById('slotr').value)" style="padding:2px 7px;font-size:11px" disabled>Apply</button><button id=slotauto onclick="applySlots(0)" style="padding:2px 7px;font-size:11px">Auto</button><span id=slothint style="color:#888"></span></span></div>
 <details id=cd style="margin:2px 0 4px"><summary style="cursor:pointer;user-select:none;font-size:12px;color:#555">&#9658; Active server command <button id=cpycmd onclick="event.preventDefault();var t=document.getElementById('cmdline').textContent;navigator.clipboard.writeText(t).then(function(){{var b=document.getElementById('cpycmd');b.textContent='copied!';setTimeout(function(){{b.textContent='copy';}},2000);}});" style="padding:1px 6px;font-size:11px;font-family:monospace">copy</button></summary><pre id=cmdline style="background:#111;color:#aaa;padding:6px;margin:2px 0;font-size:11px;white-space:pre-wrap;word-break:break-all">(no model loaded)</pre></details>
 <div class=bar>
 <label>Default model: <select id=dm onchange="setDM(this.value)">{dm_opts}</select></label>
@@ -728,10 +728,10 @@ function copyCtx(){{
 // Mirrors plan_slots() in serve.py — keep the two in step.
 function planSlots(p,want){{
   var b=p.ctx_budget,t=p.n_ctx_train||0,mx=Math.max(1,Math.min(p.max_slots||8,Math.floor(b/(p.min_slot_ctx||2048))));
-  var auto=t>0?Math.max(1,Math.min(mx,Math.floor(b/t))):1,mn=(p.mode=='clamp'&&t>0)?auto:1;
+  var auto=t>0?Math.max(1,Math.min(mx,Math.floor(b/t))):1,capped=p.mode!='yarn'&&t>0,mn=capped?auto:1;
   var n=want>0?Math.max(mn,Math.min(mx,want)):auto;
   var per=Math.floor(Math.floor(b/n)/256)*256||Math.floor(b/n);
-  if(p.mode=='clamp'&&t>0)per=Math.min(per,t);
+  if(capped)per=Math.min(per,t);
   return {{n:n,per:per,min:mn,max:mx,auto:auto,train:t}};
 }}
 var slotPlan=null,slotPlanKey='',slotDirty=false;
@@ -739,7 +739,7 @@ function slotLabel(v){{
   var q=planSlots(slotPlan,v),f=function(n){{return Number(n).toLocaleString();}};
   var t=q.n+' slot'+(q.n>1?'s':'')+' × '+f(q.per);
   if(q.train){{
-    if(q.per>q.train)t+=' — '+(q.per/q.train).toFixed(2)+'× '+(slotPlan.mode=='none'?'unscaled':slotPlan.mode+' scaling');
+    if(q.per>q.train)t+=' — '+(q.per/q.train).toFixed(2)+'× yarn scaling';
     else if(q.per<q.train)t+=' — '+Math.round(100*q.per/q.train)+'% of trained';
     else t+=' — trained length';
   }}
@@ -756,6 +756,8 @@ function renderSlots(p){{
   mm.textContent='slots for '+p.model_id+(p.slots?'':' (auto)')+':';
   r.min=q.min;r.max=q.max;r.disabled=q.min==q.max;
   if(!slotDirty)r.value=q.n;
+  document.getElementById('slothint').textContent=(p.mode!='yarn'&&q.train&&p.ctx_budget>q.auto*q.train)
+    ?'set Past trained context to yarn to go past '+Number(q.train).toLocaleString()+' per slot':'';
   ctl.style.display='inline-flex';slotMoved(true);
 }}
 function slotMoved(fromRender){{

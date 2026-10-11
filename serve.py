@@ -548,8 +548,8 @@ if mmp and os.path.isfile(mmp):
 #   clamp  — ceiling the context at the trained length (default); the slot
 #            slider can't go below the auto slot count
 #   yarn   — keep the larger context, extend it with YaRN RoPE scaling
-#   linear — keep the larger context, extend it with linear RoPE scaling
-#   none   — keep the larger context, no scaling (llama-server's own behaviour)
+#   linear — planned like clamp: llama-server caps every slot at the trained
+#   none     length unless YaRN raises it, so these can't extend anymore
 # /app/ctx_overflow (written by the editor) wins over the CTX_OVERFLOW env var,
 # the same way /app/cache_type wins over CACHE_TYPE_K/V.
 CTX_OVERFLOW_FILE='/app/ctx_overflow'
@@ -574,14 +574,17 @@ MIN_SLOT_CTX=2048
 def model_file(d,mid): return os.path.join(d,''.join(c if c.isalnum() or c in '._-' else '_' for c in mid))
 def plan_slots(budget,train,mode,want=0):
     """(slots, per-slot ctx, min, max, auto) for a total budget. Fewer slots
-    than auto would push each slot past the trained length, so clamp only
-    allows auto and up; the extension modes allow down to 1."""
+    than auto would push each slot past the trained length, which only yarn
+    can do: llama-server caps a slot at the model's n_ctx_train and only
+    raises that for YaRN scaling, so linear and none are planned like clamp.
+    Those allow auto and up; yarn allows down to 1."""
     smax=max(1,min(MAX_SLOTS,budget//MIN_SLOT_CTX))
     sauto=max(1,min(smax,budget//train)) if train>0 else 1
-    smin=sauto if (mode=='clamp' and train>0) else 1
+    capped=mode!='yarn' and train>0
+    smin=sauto if capped else 1
     n=max(smin,min(smax,want)) if want>0 else sauto
     per=(budget//n//256)*256 or budget//n
-    if mode=='clamp' and train>0: per=min(per,train)
+    if capped: per=min(per,train)
     return n,per,smin,smax,sauto
 want=0;slots_src='auto'
 _raw_par=os.environ.get('PARALLEL','auto').strip().lower()
@@ -603,16 +606,12 @@ try:
          'max_slots':MAX_SLOTS,'min_slot_ctx':MIN_SLOT_CTX,'ts':int(time.time())}))
 except OSError as e: print(f'[serve] warn: could not save ctx budget: {e}',flush=True)
 rope_args=[];ctx_note=''
-if ctx_train_known and per>n_ctx_train:
+if ctx_train_known and per>n_ctx_train:   # only reachable with yarn
     factor=per/n_ctx_train
-    if co in ('yarn','linear'):
-        rope_args=['--rope-scaling',co,'--rope-scale',f'{factor:.4f}']
-        if co=='yarn': rope_args+=['--yarn-orig-ctx',str(n_ctx_train)]
-        ctx_note=f'{co} rope scaling x{factor:.2f} past the trained {n_ctx_train}'
-    else:
-        ctx_note=f'{per} per slot past the trained {n_ctx_train}, unscaled'
-elif ctx_train_known and co=='clamp' and par==slots_auto and ctx_budget//par>n_ctx_train:
-    ctx_note=f'clamped to the trained {n_ctx_train} per slot'
+    rope_args=['--rope-scaling','yarn','--rope-scale',f'{factor:.4f}','--yarn-orig-ctx',str(n_ctx_train)]
+    ctx_note=f'yarn rope scaling x{factor:.2f} past the trained {n_ctx_train}'
+elif ctx_train_known and par==slots_auto and ctx_budget//par>n_ctx_train:
+    ctx_note=f'clamped to the trained {n_ctx_train} per slot'+(f' ({co} can\'t extend in llama-server; use yarn)' if co!='clamp' else '')
 print(f'[serve] slots: {par} ({slots_src}; auto={slots_auto}, range {slots_min}-{slots_max}) x {per} of budget {ctx_budget}'
       +(f' — {ctx_note}' if ctx_note else ''),flush=True)
 if not ctx_train_known:

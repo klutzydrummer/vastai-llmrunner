@@ -120,14 +120,14 @@ model. It shows, as you drag it, what each slot count gives:
 
 - left, toward **◀ slots**: more slots, each with less context (any mode);
 - right, toward **context ▶**: fewer slots, each past the trained length, extended
-  with RoPE scaling — only with a `yarn`, `linear` or `none`
-  [Past trained context](#going-past-the-trained-context) mode. With `clamp`
-  the slider stops at the auto count.
+  with YaRN RoPE scaling — only with the `yarn`
+  [Past trained context](#going-past-the-trained-context) mode. Otherwise the
+  slider stops at the auto count.
 
-With `clamp`, budget beyond the auto slots' trained length goes unused. With
-the other modes every slot count uses the whole budget, so at auto the
-remainder is spread across the slots and extended too (1 slot × 511,488 at
-1.95× yarn on a 262k model with ~511k of budget).
+Outside `yarn`, budget beyond the auto slots' trained length goes unused. With
+`yarn` every slot count uses the whole budget, so at auto the remainder is
+spread across the slots and extended too (1 slot × 511,488 at 1.95× yarn on a
+262k model with ~511k of budget).
 
 **Apply** saves the count in `/app/slots/<model id>` and reloads the model if
 it is the one running; **Auto** removes it. The options come from the budget
@@ -147,8 +147,15 @@ per-slot context (budget / slots) exceeds the GGUF's `context_length`:
 | --- | --- |
 | `clamp` (default) | ceiling the context at the trained length — safest, no quality loss; any budget past the auto slots' trained length goes unused |
 | `yarn` | keep the larger context and extend it with YaRN RoPE scaling (`--rope-scaling yarn --rope-scale <factor> --yarn-orig-ctx <trained>`) |
-| `linear` | same, with linear RoPE scaling |
-| `none` | keep the larger context with no scaling — llama-server's own behaviour, which is what used to crash |
+| `linear` | treated as `clamp` — see below |
+| `none` | treated as `clamp` — see below |
+
+llama-server caps every slot at the model's trained context
+(`n_ctx_slot()` in `tools/server/server-context.cpp`) and only raises that
+cap when YaRN scaling is set (`llama-context.cpp` re-derives `n_ctx_train`
+from `--yarn-orig-ctx / rope-freq-scale`). Linear or no scaling would only
+spend VRAM on context llama-server never lets a slot use, so `serve.py` plans
+those modes like `clamp`, and the context line notes it.
 
 `clamp` also applies to an explicit `CTX_SIZE`, so the ceiling is never
 exceeded. When the GGUF does not declare a `context_length`, nothing is changed.
