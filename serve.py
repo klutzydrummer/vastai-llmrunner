@@ -429,32 +429,6 @@ mmp=_paths.get(MMPROJ_URL,'') if MMPROJ_URL in _want else ''
 dmp=_paths.get(DRAFT_MODEL_URL,'') if DRAFT_MODEL_URL in _want else ''
 
 
-def _detect_vrams(retries=5,delay=3):
-    best=[];prev=None
-    for attempt in range(retries):
-        try:
-            r=sp.run(['nvidia-smi','--query-gpu=memory.total','--format=csv,noheader,nounits'],
-                     capture_output=True,text=True,timeout=10)
-            parsed=[int(x) for x in r.stdout.strip().split('\n') if x.strip()]
-            print(f'[serve] nvidia-smi attempt {attempt+1}/{retries}: {parsed}',flush=True)
-            if len(parsed)>len(best): best=parsed
-            if parsed and parsed==prev:
-                print(f'[serve] GPU count stable at {len(best)}',flush=True); break
-            prev=parsed
-        except Exception as e:
-            print(f'[serve] nvidia-smi attempt {attempt+1}/{retries} failed: {e}',flush=True)
-            prev=None
-        if attempt<retries-1:
-            print(f'[serve] retrying GPU detection in {delay}s...',flush=True)
-            time.sleep(delay)
-    if not best:
-        print(f'[serve] warn: no GPUs detected after {retries} attempts, will use CPU offload',flush=True)
-    else:
-        print(f'[serve] detected {len(best)} GPU(s): {best} MiB  total={sum(best)} MiB',flush=True)
-    return best
-
-vrams=_detect_vrams()
-tv=sum(vrams)
 TM={0:('<B',1),1:('<b',1),2:('<H',2),3:('<h',2),4:('<I',4),5:('<i',4),6:('<f',4),7:('<?',1),8:(None,None),9:(None,None),10:('<Q',8),11:('<q',8),12:('<d',8)}
 rs=lambda f:f.read(struct.unpack('<Q',f.read(8))[0]).decode('utf-8','replace')
 def sv(f,t):
@@ -496,6 +470,86 @@ def find_binary():
     if r:return r
     raise RuntimeError('llama-server not found in /app, /, or PATH')
 
+def _smi_vrams(retries=5,delay=3):
+    best=[];prev=None
+    for attempt in range(retries):
+        try:
+            r=sp.run(['nvidia-smi','--query-gpu=memory.total','--format=csv,noheader,nounits'],
+                     capture_output=True,text=True,timeout=10)
+            if r.returncode==127 or 'No such file' in r.stderr:
+                # e.g. a vast.ai wrapper script whose nvidia-smi.real is missing
+                print(f'[serve] nvidia-smi unusable: {r.stderr.strip()[:200]}',flush=True); return []
+            parsed=[int(x) for x in r.stdout.strip().split('\n') if x.strip()]
+            print(f'[serve] nvidia-smi attempt {attempt+1}/{retries}: {parsed}',flush=True)
+            if len(parsed)>len(best): best=parsed
+            if parsed and parsed==prev:
+                print(f'[serve] GPU count stable at {len(best)}',flush=True); break
+            prev=parsed
+        except FileNotFoundError:
+            print('[serve] nvidia-smi not found',flush=True); return []
+        except Exception as e:
+            print(f'[serve] nvidia-smi attempt {attempt+1}/{retries} failed: {e}',flush=True)
+            prev=None
+        if attempt<retries-1:
+            print(f'[serve] retrying GPU detection in {delay}s...',flush=True)
+            time.sleep(delay)
+    return best
+
+def _nvml_vrams():
+    """Total MiB per GPU straight from NVML (libnvidia-ml, part of the driver),
+    for when the nvidia-smi binary is missing or broken."""
+    import ctypes
+    nv=None
+    for name in ('libnvidia-ml.so.1','libnvidia-ml.so'):
+        try: nv=ctypes.CDLL(name); break
+        except OSError: pass
+    if nv is None or nv.nvmlInit_v2()!=0: return []
+    class _Mem(ctypes.Structure):
+        _fields_=[('total',ctypes.c_ulonglong),('free',ctypes.c_ulonglong),('used',ctypes.c_ulonglong)]
+    out=[]
+    try:
+        n=ctypes.c_uint()
+        if nv.nvmlDeviceGetCount_v2(ctypes.byref(n))!=0: return []
+        for i in range(n.value):
+            h=ctypes.c_void_p();m=_Mem()
+            if nv.nvmlDeviceGetHandleByIndex_v2(i,ctypes.byref(h))!=0: continue
+            if nv.nvmlDeviceGetMemoryInfo(h,ctypes.byref(m))!=0: continue   # unified memory: not supported
+            out.append(int(m.total//1048576))
+    finally: nv.nvmlShutdown()
+    return out
+
+def parse_list_devices(text):
+    """MiB per device from `llama-server --list-devices`, whose lines look like
+    '  CUDA0: NVIDIA H100 80GB HBM3 (81008 MiB, 80484 MiB free)'."""
+    import re
+    return [int(m.group(1)) for m in re.finditer(r'^\s*\w+\d+: .*\((\d+) MiB, \d+ MiB free\)\s*$',text,re.M)]
+
+def _llama_vrams():
+    try:
+        r=sp.run([find_binary(),'--list-devices'],capture_output=True,text=True,timeout=120)
+        return parse_list_devices(r.stdout+'\n'+r.stderr)
+    except Exception as e:
+        print(f'[serve] llama-server --list-devices failed: {e}',flush=True); return []
+
+def _detect_vrams():
+    """MiB per GPU. VRAM_MB (one number, or one per GPU comma-separated) wins;
+    otherwise nvidia-smi, then NVML, then llama-server --list-devices."""
+    raw=os.environ.get('VRAM_MB','').strip()
+    if raw:
+        try:
+            v=[int(float(x)) for x in raw.split(',') if x.strip()]
+            print(f'[serve] VRAM from VRAM_MB: {v} MiB',flush=True); return v
+        except ValueError: print(f'[serve] warn: bad VRAM_MB={raw!r}, detecting instead',flush=True)
+    for name,fn in (('nvidia-smi',_smi_vrams),('NVML',_nvml_vrams),('llama-server --list-devices',_llama_vrams)):
+        try: v=fn()
+        except Exception as e: print(f'[serve] {name} failed: {e}',flush=True); v=[]
+        if v:
+            print(f'[serve] detected {len(v)} GPU(s) via {name}: {v} MiB  total={sum(v)} MiB',flush=True); return v
+    print('[serve] warn: no GPU memory detected (nvidia-smi, NVML, llama-server) — set VRAM_MB',flush=True)
+    return []
+
+vrams=_detect_vrams()
+tv=sum(vrams)
 meta,arch=pg(mp);P=lambda k,d:meta.get(f'{arch}.{k}',d)
 scalar=lambda v:int(v[0]) if isinstance(v,(list,tuple)) else int(v)
 nl=scalar(P('block_count',32));nkv=scalar(P('attention.layer_count',nl))
@@ -610,6 +664,8 @@ if ctx_train_known and per>n_ctx_train:   # only reachable with yarn
     factor=per/n_ctx_train
     rope_args=['--rope-scaling','yarn','--rope-scale',f'{factor:.4f}','--yarn-orig-ctx',str(n_ctx_train)]
     ctx_note=f'yarn rope scaling x{factor:.2f} past the trained {n_ctx_train}'
+elif not vrams and not os.environ.get('CTX_SIZE'):
+    ctx_note='no GPU memory detected — set VRAM_MB (or CTX_SIZE) in the container env'
 elif ctx_train_known and par==slots_auto and ctx_budget//par>n_ctx_train:
     ctx_note=f'clamped to the trained {n_ctx_train} per slot'+(f' ({co} can\'t extend in llama-server; use yarn)' if co!='clamp' else '')
 print(f'[serve] slots: {par} ({slots_src}; auto={slots_auto}, range {slots_min}-{slots_max}) x {per} of budget {ctx_budget}'
