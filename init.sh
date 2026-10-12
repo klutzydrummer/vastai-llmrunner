@@ -5,6 +5,14 @@ LOG(){ echo "[$(date '+%H:%M:%S')] [init] $*"; }
 ERR(){ echo "[$(date '+%H:%M:%S')] [init] ERROR: $*" >&2; }
 die(){ ERR "$*"; exit 1; }
 
+# Release assets are named by Go arch. Some hosts (e.g. GH200) are aarch64,
+# where an amd64 binary fails with "Exec format error".
+case "$(uname -m)" in
+    x86_64|amd64)  ARCH=amd64 ;;
+    aarch64|arm64) ARCH=arm64 ;;
+    *) die "unsupported CPU architecture: $(uname -m)" ;;
+esac
+
 # retry MAX INITIAL_DELAY_SECS CMD [ARGS...]  — exponential backoff wrapper
 retry(){
     local max="$1" delay="$2"; shift 2
@@ -107,11 +115,20 @@ get_latest_tag(){
     return 1
 }
 
+# runs NAME  — false if the binary cannot be executed at all (wrong arch,
+# corrupt file). Exit 126/127 come from the shell; any other status means the
+# binary ran, whatever it thought of --version.
+runs(){
+    local rc=0
+    timeout 10 "$1" --version >/dev/null 2>&1 || rc=$?
+    (( rc != 126 && rc != 127 ))
+}
+
 # download_bin NAME REPO TAG_TO_VER_SED ASSET_TPL IS_TAR
 #   NAME         binary name in PATH
 #   REPO         e.g. mostlygeek/llama-swap
 #   TAG_TO_VER   sed expression to strip prefix (e.g. 's/^v//')
-#   ASSET_TPL    asset filename template; TAG and VER are substituted
+#   ASSET_TPL    asset filename template; TAG, VER and ARCH are substituted
 #   IS_TAR       true|false
 download_bin(){
     local name="$1"
@@ -121,8 +138,12 @@ download_bin(){
     local is_tar="${5:-true}"
 
     if command -v "$name" >/dev/null 2>&1; then
-        LOG "$name already installed"
-        return 0
+        if runs "$name"; then
+            LOG "$name already installed"
+            return 0
+        fi
+        LOG "$name is installed but will not run on $ARCH, reinstalling"
+        rm -f "$(command -v "$name")"
     fi
 
     LOG "resolving latest release for $repo"
@@ -130,7 +151,7 @@ download_bin(){
     tag=$(retry 3 5 get_latest_tag "$repo") \
         || die "could not resolve latest tag for $repo after retries"
     ver=$(echo "$tag" | sed "$tag_strip")
-    asset=$(echo "$asset_tpl" | sed "s/TAG/$tag/g; s/VER/$ver/g")
+    asset=$(echo "$asset_tpl" | sed "s/TAG/$tag/g; s/VER/$ver/g; s/ARCH/$ARCH/g")
     url="https://github.com/${repo}/releases/download/${tag}/${asset}"
 
     LOG "downloading $name  tag=$tag  asset=$asset"
@@ -154,6 +175,7 @@ download_bin(){
     chmod +x /usr/local/bin/"$name"
     rm -rf "$tmp"
     command -v "$name" >/dev/null 2>&1 || die "$name not in PATH after install"
+    runs "$name" || die "$name was installed but will not run on $ARCH ($url)"
     LOG "$name installed OK"
 }
 
@@ -313,25 +335,25 @@ main(){
     install_pip_deps
     install_ffmpeg
 
-    # llama-swap: tag=v211 → ver=211 → llama-swap_211_linux_amd64.tar.gz
+    # llama-swap: tag=v211 → ver=211 → llama-swap_211_linux_ARCH.tar.gz
     download_bin llama-swap \
         mostlygeek/llama-swap \
         's/^v//' \
-        'llama-swap_VER_linux_amd64.tar.gz' \
+        'llama-swap_VER_linux_ARCH.tar.gz' \
         true
 
-    # caddy: tag=v2.11.2 → ver=2.11.2 → caddy_2.11.2_linux_amd64.tar.gz
+    # caddy: tag=v2.11.2 → ver=2.11.2 → caddy_2.11.2_linux_ARCH.tar.gz
     download_bin caddy \
         caddyserver/caddy \
         's/^v//' \
-        'caddy_VER_linux_amd64.tar.gz' \
+        'caddy_VER_linux_ARCH.tar.gz' \
         true
 
     # cloudflared: tag=2026.3.0, asset name has no version
     download_bin cloudflared \
         cloudflare/cloudflared \
         's/.*//' \
-        'cloudflared-linux-amd64' \
+        'cloudflared-linux-ARCH' \
         false
 
     gen_config
