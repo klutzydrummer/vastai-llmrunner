@@ -28,7 +28,18 @@ verifies with `vastai show instances --raw | jq`, logs to `LOG`, and sends
 - TESTED (awake, fake `vastai`): `tools/deadman/test-dummy.sh` covers arm, timer
   listed, unit file persisted, inhibitor active, two failed destroys then a
   verified one, disarm leaving nothing, and a never-succeeds case exiting 1.
-- NOT tested: suspend/resume catch-up and reboot catch-up (doc-based only).
+- SIMULATED (no suspend/reboot): `tools/deadman/test-catchup.sh` stops the timer
+  across the deadline then restarts it, re-execs the user manager, and restarts
+  an enabled-but-stopped timer; all fire and verify. This shows the `Persistent=`
+  logic, not a real suspend or reboot.
+- NOT tested on the host: real suspend/resume and reboot catch-up (UNRUN, see
+  `docs/deadman-host-tests.md` for the commands you run).
+- Limits (official docs, 2026-11-26): `WakeSystem=` needs the system manager, so a
+  user timer cannot wake a suspended host. The sleep inhibitor does not stop a
+  lid close (`LidSwitchIgnoreInhibited=yes` by default); it does cover the suspend
+  key and idle. Reboot needs `loginctl enable-linger` (`Linger=yes` here).
+  Sources: https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html
+  https://www.freedesktop.org/software/systemd/man/latest/logind.conf.html
 - NOT tested: a real `vastai` destroy.
 
 ## Credentials
