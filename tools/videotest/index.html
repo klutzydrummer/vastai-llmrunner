@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Video test</title>
+<style>
+body{font:16px system-ui,sans-serif;max-width:780px;margin:0 auto;padding:12px}
+label{display:block;margin:10px 0 2px;font-weight:600}
+input,select,textarea,button{font:inherit;width:100%;box-sizing:border-box;padding:8px}
+.row{display:flex;gap:8px}.row>*{flex:1}
+label.cb{font-weight:400;display:flex;gap:6px;align-items:center}label.cb input{width:auto}
+button{margin-top:12px;font-weight:700}
+pre{white-space:pre-wrap;background:#eee;color:#111;padding:8px;border-radius:6px}
+#frames img{height:60px;margin:2px}video{max-width:100%}
+</style></head><body>
+<h2>Video upload test</h2>
+<label>Video</label>
+<input id="file" type="file" accept="video/*">
+<video id="preview" controls playsinline hidden></video>
+<label>Endpoint</label>
+<select id="endpoint"></select>
+<div id="customBox" hidden>
+ <label>Custom base URL (http/https, ending in /v1)</label><input id="base" placeholder="http://host:port/v1">
+ <label>API key (kept in memory only)</label><input id="key" type="password" autocomplete="off">
+</div>
+<label>Model</label>
+<div class="row"><select id="modelSel"></select><input id="model" placeholder="or type a model id"></div>
+<button id="refresh" type="button">Refresh models</button>
+<label>Prompt</label>
+<select id="preset"></select>
+<textarea id="prompt" rows="3"></textarea>
+<div class="row">
+ <div><label>Frames</label><input id="nframes" type="number" min="1" max="64" value="8"></div>
+ <div><label>Max edge (px)</label><select id="edge"><option>256</option><option selected>512</option><option>768</option><option>1024</option></select></div>
+ <div><label>Max tokens</label><input id="maxtok" type="number" value="400"></div>
+</div>
+<label class="cb"><input id="audio" type="checkbox" checked> Send audio track (16 kHz mono WAV)</label>
+<label class="cb"><input id="raw" type="checkbox"> Raw video mode (send video_url data URI instead of frames+audio)</label>
+<button id="go" type="button">Send</button>
+<h3>Status</h3><pre id="status">idle</pre>
+<div id="frames"></div>
+<h3>Reply</h3><pre id="reply"></pre>
+<script src="/app.js"></script>
+</body></html>

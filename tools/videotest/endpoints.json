@@ -1,0 +1,4 @@
+{
+  "home": {"base": "http://127.0.0.1:18800/v1"},
+  "custom": {"base": null}
+}
