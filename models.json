@@ -8,7 +8,11 @@
     "image_max_tokens": 1024
   },
   "presets": {
-    "all": ["Gryphe_Pantheon-Reasoning-26B-A4B-1.1-V2-Q8_0", "gemma-4-12B-it-heretic-Q8_0", "TheDrummer_Artemis-31B-v1.2-Q8_0"]
+    "all": [
+      "Gryphe_Pantheon-Reasoning-26B-A4B-1.1-V2-Q8_0",
+      "gemma-4-12B-it-heretic-Q8_0",
+      "TheDrummer_Artemis-31B-v1.2-Q8_0"
+    ]
   },
   "models": {
     "Gryphe_Pantheon-Reasoning-26B-A4B-1.1-V2-Q8_0": {
@@ -28,6 +32,45 @@
       "mmproj": "https://huggingface.co/bartowski/TheDrummer_Artemis-31B-v1.2-GGUF/resolve/main/mmproj-TheDrummer_Artemis-31B-v1.2-bf16.gguf",
       "draft": "https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main/MTP/mtp-gemma-4-31B-it-Q8_0.gguf",
       "note": "2026-11-25. bartowski Q8_0 (32.6 GB) of Gemma-4-31B finetune with its own fine-tuned mmproj; draft is the base unsloth 31B MTP (acceptance with the finetune unmeasured)."
+    }
+  },
+  "images": {
+    "note": "Image and video models for sd.cpp sd-server, run by llama-swap. Select with IMAGE_MODELS=id1,id2 (ids or preset names); unset = disabled. No secrets here.",
+    "defaults": {
+      "offload_to_cpu": false
+    },
+    "presets": {
+      "all-images": [
+        "z-image-turbo",
+        "wan22-ti2v-5b"
+      ]
+    },
+    "models": {
+      "z-image-turbo": {
+        "kind": "image",
+        "diffusion_model": "https://huggingface.co/leejet/Z-Image-Turbo-GGUF/resolve/main/z_image_turbo-Q8_0.gguf",
+        "llm": "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+        "vae": "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/vae/ae.safetensors",
+        "cfg_scale": 1.0,
+        "steps": 8,
+        "width": 1024,
+        "height": 1024,
+        "offload_to_cpu": false,
+        "note": "2026-11-25. Z-Image-Turbo Q8_0 6.58 GB (apache-2.0, sha256 df1c5baa86d1398c979495a6072dbcee79444fdb884a2445582ba0769c44e9a1) + Qwen3-4B-Instruct-2507 Q4_K_M 2.50 GB (apache-2.0) + FLUX ae VAE 335 MB from the public Comfy-Org mirror (sha256 afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38; its licence is unverified, the BFL original is apache-2.0 but gated). About 9.4 GB total; VRAM use unmeasured."
+      },
+      "wan22-ti2v-5b": {
+        "kind": "video",
+        "diffusion_model": "https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF/resolve/main/Wan2.2-TI2V-5B-Q8_0.gguf",
+        "t5xxl": "https://huggingface.co/city96/umt5-xxl-encoder-gguf/resolve/main/umt5-xxl-encoder-Q8_0.gguf",
+        "vae": "https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF/resolve/main/VAE/Wan2.2_VAE.safetensors",
+        "flow_shift": 3.0,
+        "cfg_scale": 6.0,
+        "sampling": "euler",
+        "video_frames": 33,
+        "width": 832,
+        "height": 480,
+        "note": "2026-11-25. Wan2.2 TI2V-5B Q8_0 5.40 GB + umt5-xxl encoder Q8_0 6.04 GB + Wan2.2 VAE 1.41 GB (sha256 e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156), 12.85 GB total, all apache-2.0. Call via /upstream/<id>/sdcpp/v1/vid_gen; SillyTavern cannot use video. VRAM use unmeasured."
+      }
     }
   }
 }

@@ -281,6 +281,114 @@ itself must be fetched by the template's onstart; add `models.json` to that
 fetch list too, or the first boot after enabling `MODELS` relies on the
 `init.sh` fetch.
 
+## Image and video generation (sd.cpp)
+
+Optional. llama-swap can also run [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)'s
+`sd-server`, so SillyTavern can generate images from the same tunnel. Set the
+container env var `IMAGE_MODELS=z-image-turbo` (ids or preset names from the
+`images` section of `models.json`, comma separated; `all-images` is a preset).
+Unset or empty means disabled: nothing is installed, downloaded or written to
+`config.yaml`. This is independent of `MODELS`.
+
+On boot `init.sh` installs the `sd-server` binaries to `/opt/sd`, `cfginit.py`
+adds one llama-swap entry per selected model, and the first request for that
+model downloads its files with the same downloader as chat models (`.part`
+files, size check, `/models`, `HF_TOKEN`, `DOWNLOAD_*` settings) through
+`imgserve.py`. Any failure in the install or in the registry is logged loudly
+and image generation stays off; chat and llama-swap still start.
+
+**Registry fields** (`images.models.<id>`, ids are free-form `[A-Za-z0-9._-]`;
+`images.defaults` and `images.presets` work like the chat registry). Only https
+URLs; unknown keys and secret-like fields are rejected.
+
+| Field | Notes |
+| --- | --- |
+| `kind` | `image` (needs `diffusion_model`, `llm`, `vae`) or `video` (needs `diffusion_model`, `t5xxl`, `vae`) |
+| `diffusion_model`, `llm`, `t5xxl`, `vae` | URLs; passed as `--diffusion-model`, `--llm`, `--t5xxl`, `--vae` |
+| `cfg_scale`, `steps`, `width`, `height` | server defaults (`--cfg-scale`, `--steps`, `-W`, `-H`); a request can override them |
+| `sampling`, `flow_shift`, `video_frames` | `--sampling-method`, `--flow-shift`, `--video-frames` |
+| `offload_to_cpu` | `--offload-to-cpu`, trades speed for VRAM |
+| `note` | free text: licence, sizes |
+
+Shipped entries: `z-image-turbo` (Z-Image-Turbo Q8_0 + Qwen3-4B encoder +
+FLUX VAE, about 9.4 GB of files) and `wan22-ti2v-5b` (Wan2.2 TI2V-5B Q8_0 +
+umt5-xxl encoder + Wan2.2 VAE, 12.85 GB of files, video). Nobody has measured
+their VRAM use on this setup; the sd.cpp docs only claim Z-Image runs in 4 GB
+with offloading.
+
+**Swap only.** Image models are ordinary llama-swap models in the same default
+group as the chat models, so only one of them is loaded at a time. An image
+request unloads the LLM (and the next chat request reloads it, which costs the
+full model load), and the reverse. `serve.py` is not told to leave room for the
+image model. A video job runs inside `sd-server` memory: if any chat request
+swaps the model out before the job finishes, the job is lost, so keep other
+traffic off the endpoint until it completes. Image models have `ttl: 0`, so
+they are never unloaded by idleness, only by another model's request.
+
+**GPU architecture.** The sd.cpp CUDA build has native kernels for sm_86
+(RTX 30xx, A40) and sm_89 (RTX 40xx, L40) only. sm_75, sm_80 (A100) and sm_90
+(H100) run by JIT-compiling PTX, which makes the first start slow (the cache
+lives in `~/.nv/ComputeCache`; `imgserve.py` raises its size limit). RTX 5090
+(sm_120) can only JIT from sm_90 PTX; that is unverified on real hardware.
+Nothing here has been run on a GPU yet.
+
+### SillyTavern
+
+Extensions → Image Generation → Source **Stable Diffusion cpp (sdcpp)**, URL
+`https://<your-tunnel>`, then pick the image model id in the model dropdown.
+SillyTavern's server fetches that URL, so it only has to reach the tunnel.
+Things to know:
+
+- The dropdown lists llama-swap's `/v1/models`, which by default shows only the
+  active model (see [Exposing only the active model](#exposing-only-the-active-model)).
+  Turn that off (`EXPOSE_ACTIVE_ONLY=0`, or the checkbox in `/editor`) so the
+  image id appears; it then also lists every LLM, so pick the image entry.
+- SillyTavern sends no API key and no LoRA field. The ping only checks that
+  llama-swap answers; it does not prove `sd-server` is up.
+- Video is not available in SillyTavern; use the API below.
+
+### Video API
+
+llama-swap does not route `/sdcpp/v1/*` by model, so go through its
+`/upstream/<id>/` prefix, which loads the model and forwards the call. A job is
+asynchronous: `vid_gen` returns 202 with an id, then poll until it completes.
+
+```sh
+curl -s https://<your-tunnel>/upstream/wan22-ti2v-5b/sdcpp/v1/vid_gen \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"a lovely cat","width":832,"height":480,"video_frames":33,"fps":16,"output_format":"webm"}'
+# -> {"id":"job_...","status":"queued","poll_url":"/sdcpp/v1/jobs/job_..."}
+
+curl -s https://<your-tunnel>/upstream/wan22-ti2v-5b/sdcpp/v1/jobs/job_...
+# states: queued, generating, completed, failed, cancelled
+```
+
+The finished job carries the WebM as base64 in its `result`. Polling the job
+through `/upstream/<id>/` reloads the model if it was swapped out meanwhile, and
+a swapped-out job is gone, so keep chat traffic away while it runs. If a client
+cannot use `/upstream/`, the fixed alternative is to give `sd-server` its own
+tunnel route to its port; that is not set up here.
+
+### Binary source and fallback
+
+sd.cpp publishes no Linux CUDA release, so `init.sh` extracts the binaries
+layer of the official `ghcr.io/leejet/stable-diffusion.cpp:master-cuda` image
+(pinned by layer digest, git rev 52491bd, verified with sha256, about 350 MB
+download and 1.3 GB on disk; needs `libgomp1` and `libnccl2`, installed with
+apt if missing). The layer is content-addressed but could disappear from ghcr
+one day. The fallback is to build `sd-server` once with CUDA and
+`-DCMAKE_CUDA_ARCHITECTURES` for your GPUs, publish the `bin/` directory as a
+`.tar.gz` with an `sd.cpp/bin/` prefix (for example as a release asset of this
+repo), and set `SD_LAYER_URL` to its URL and `SD_LAYER_DIGEST=sha256:<hash of
+that file>`. This repo does not ship such a build.
+
+### Licences
+
+Z-Image-Turbo, Wan2.2 TI2V-5B and Qwen3-4B-Instruct-2507 are apache-2.0, and so
+are the GGUF conversions used (HF metadata, 2026-11-25). The FLUX `ae` VAE is
+fetched from the Comfy-Org mirror because the Black Forest Labs repo is gated;
+that mirror's licence was not verified. sd.cpp is MIT.
+
 ## Configuring the embedding model
 
 In `/editor` → **Embeddings**, choose a preset or paste any GGUF URL, then

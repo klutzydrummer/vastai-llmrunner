@@ -51,7 +51,7 @@ update_scripts(){
     # started just after a push can otherwise boot the previous copy. A unique
     # query string plus no-cache skips the edge cache.
     local cb; cb=$(date +%s%N)
-    for f in serve.py cfginit.py cfgedit.py guard.py embed.py models.json; do
+    for f in serve.py cfginit.py cfgedit.py guard.py embed.py imgserve.py models.json; do
         if curl -fsSL --max-time 30 -H 'Cache-Control: no-cache' "$base/$f?cb=$cb" -o "/tmp/$f"; then
             LOG "updated $f"
         else
@@ -177,6 +177,69 @@ download_bin(){
     command -v "$name" >/dev/null 2>&1 || die "$name not in PATH after install"
     runs "$name" || die "$name was installed but will not run on $ARCH ($url)"
     LOG "$name installed OK"
+}
+
+# ── sd.cpp sd-server (image/video generation) ─────────────────────────────────
+# Only when IMAGE_MODELS is set. sd.cpp publishes no Linux CUDA release binary,
+# so we take the binaries layer of the official CUDA image, ghcr.io/leejet/
+# stable-diffusion.cpp:master-cuda, straight from the registry (no docker).
+# Pinned (2026-11-25): layer blob sha256:8e9cc7f2... = `COPY /sd.cpp/build/bin`,
+# from git rev 52491bd9f1fc15281791723bdff13baab7fd6819, amd64 manifest
+# sha256:dd56cb1a03b79ec1e74672b56cee8167f113fce89b48398f868cb57225338a9d.
+# The blob is content-addressed and verified by sha256. Fallback mirror: a
+# tarball of the same bin/ dir (e.g. a release asset of this repo) via
+# SD_LAYER_URL, with SD_LAYER_DIGEST naming the sha256 of that file.
+# Native CUDA kernels: sm_86 and sm_89 only; other GPUs JIT from PTX.
+SD_DIR=/opt/sd
+SD_LAYER_DIGEST="${SD_LAYER_DIGEST:-sha256:8e9cc7f29be6542ef8b2ff781e6e2d40f29097da5f9d55705d2ca5bf8b9e236b}"
+SD_GHCR_REPO=leejet/stable-diffusion.cpp
+
+_sd_fetch(){
+    local want="${SD_LAYER_DIGEST#sha256:}" tmp="$1" url="${SD_LAYER_URL:-}" tok
+    if [ -z "$url" ]; then
+        tok=$(curl -fsS --max-time 30 "https://ghcr.io/token?scope=repository:${SD_GHCR_REPO}:pull" \
+              | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])') || return 1
+        curl -fL --retry 5 --retry-delay 5 --max-time 1800 -H "Authorization: Bearer $tok" \
+            "https://ghcr.io/v2/${SD_GHCR_REPO}/blobs/${SD_LAYER_DIGEST}" -o "$tmp/layer.tgz" || return 1
+    else
+        curl -fL --retry 5 --retry-delay 5 --max-time 1800 "$url" -o "$tmp/layer.tgz" || return 1
+    fi
+    echo "$want  $tmp/layer.tgz" | sha256sum -c - >/dev/null || { ERR "sd.cpp archive sha256 mismatch"; return 1; }
+    tar -xzf "$tmp/layer.tgz" -C "$SD_DIR" --strip-components=2 sd.cpp/bin
+}
+
+install_sd(){
+    local stamp="$SD_DIR/.layer-digest" tmp
+    if [ -x "$SD_DIR/sd-server" ] && [ "$(cat "$stamp" 2>/dev/null)" = "$SD_LAYER_DIGEST" ]; then
+        LOG "sd-server already installed ($SD_LAYER_DIGEST)"
+    else
+        [ "$ARCH" = amd64 ] || { ERR "sd.cpp binaries are amd64 only; image generation disabled"; return 1; }
+        mkdir -p "$SD_DIR" /models
+        # ~350 MB download, ~1.3 GB extracted
+        local free_mb; free_mb=$(df -Pm "$SD_DIR" | awk 'NR==2{print $4}')
+        if [ "${free_mb:-0}" -lt 1800 ]; then
+            ERR "only ${free_mb:-?} MB free for sd.cpp (need ~1800); image generation disabled"; return 1
+        fi
+        tmp=$(mktemp -d)
+        LOG "installing sd-server from $SD_LAYER_DIGEST"
+        if ! _sd_fetch "$tmp"; then
+            rm -rf "$tmp"; ERR "sd-server download/extract failed; image generation disabled"; return 1
+        fi
+        rm -rf "$tmp"
+        [ -x "$SD_DIR/sd-server" ] || { ERR "sd-server not found after extract"; return 1; }
+        echo "$SD_LAYER_DIGEST" > "$stamp"
+        LOG "sd-server installed OK"
+    fi
+    # Runtime libs ggml-cuda needs that the llama.cpp image may lack (best effort).
+    local pkgs=""
+    ldconfig -p 2>/dev/null | grep -q 'libnccl.so.2' || pkgs="$pkgs libnccl2"
+    ldconfig -p 2>/dev/null | grep -q 'libgomp.so.1' || pkgs="$pkgs libgomp1"
+    if [ -n "$pkgs" ]; then
+        LOG "installing sd.cpp runtime libs:$pkgs"
+        apt-get update -qq && apt-get install -y -qq $pkgs \
+            || ERR "could not install$pkgs; image generation may fail to start"
+    fi
+    return 0
 }
 
 # ── config generation ─────────────────────────────────────────────────────────
@@ -355,6 +418,10 @@ main(){
         's/.*//' \
         'cloudflared-linux-ARCH' \
         false
+
+    if [ -n "${IMAGE_MODELS:-}" ]; then
+        install_sd || ERR "sd.cpp setup failed; continuing, image models will not start"
+    fi
 
     gen_config
     start_embed

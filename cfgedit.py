@@ -34,7 +34,7 @@ EXPOSE_ACTIVE_ONLY_FILE='/app/expose_active_only'
 TRUTHY={'1','true','yes','on'}
 LLAMA_SWAP_HOST='localhost'; LLAMA_SWAP_PORT=8080
 SCRIPTS_BASE='https://raw.githubusercontent.com/klutzydrummer/vastai-llmrunner/'+(os.environ.get('REPO_REF') or 'main')
-SCRIPTS=['serve.py','cfgedit.py','guard.py','cfginit.py','embed.py','init.sh','models.json']
+SCRIPTS=['serve.py','cfgedit.py','guard.py','cfginit.py','embed.py','imgserve.py','init.sh','models.json']
 EMBED_STATUS='/tmp/embed_status.json'
 # Outcome of the last "Update Scripts" run, read back by the UI after the
 # editor re-execs so it can say which files actually changed.

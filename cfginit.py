@@ -77,7 +77,7 @@ def validate_registry(reg, selected=None):
     if not isinstance(reg, dict): return ["top level must be an object"]
     for k in reg:
         if _secretish(k): errs.append(f"secret-like top-level field {k!r} not allowed")
-        elif k not in ("models", "defaults", "presets", "note"): errs.append(f"unknown top-level key {k!r}")
+        elif k not in ("models", "defaults", "presets", "note", "images"): errs.append(f"unknown top-level key {k!r}")
     models = reg.get("models")
     if not isinstance(models, dict) or not models: return errs + ["'models' must be a non-empty object"]
     knobs = set(KNOBS) | {"cache_type"}
@@ -166,13 +166,141 @@ def load_registry():
     print("[init] ERROR: MODELS is set but no valid registry; falling back to params.json/env models", flush=True)
     return None
 
+# ── image / video models (models.json "images", sd.cpp sd-server) ────────────
+# Selected with IMAGE_MODELS=id1,id2 (ids or preset names). Unset = disabled:
+# nothing is downloaded or written to config.yaml. A bad "images" section only
+# disables images; it never affects the chat registry or stops llama-swap.
+IMG_KINDS = ("image", "video")
+IMG_URLS = {"diffusion_model": "DIFFUSION", "llm": "LLM", "t5xxl": "T5XXL", "vae": "VAE"}
+IMG_FLAG_NAMES = {"diffusion_model": "--diffusion-model", "llm": "--llm", "t5xxl": "--t5xxl", "vae": "--vae"}
+IMG_REQUIRED = {"image": ("diffusion_model", "llm", "vae"), "video": ("diffusion_model", "t5xxl", "vae")}
+IMG_SAMPLERS = {"euler","euler_a","heun","dpm2","dpm++2s_a","dpm++2m","dpm++2mv2","ipndm","ipndm_v","lcm","ddim_trailing","tcd"}
+# knob -> (sd-server flag, kind of value, lo, hi)
+IMG_NUM = {"cfg_scale": ("--cfg-scale", float, 0, 30), "steps": ("--steps", int, 1, 200),
+           "width": ("-W", int, 64, 4096), "height": ("-H", int, 64, 4096),
+           "flow_shift": ("--flow-shift", float, 0, 20), "video_frames": ("--video-frames", int, 1, 257)}
+IMG_KNOBS = set(IMG_NUM) | {"sampling", "offload_to_cpu"}
+IMG_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+def _check_img_knobs(where, d, errs):
+    for k, v in d.items():
+        if k in IMG_NUM:
+            _f, typ, lo, hi = IMG_NUM[k]
+            ok = isinstance(v, (int, float)) and not isinstance(v, bool) and (typ is float or isinstance(v, int))
+            if not ok or not lo <= v <= hi: errs.append(f"{where}.{k}: must be a number in {lo}..{hi}")
+            elif k in ("width", "height") and v % 8: errs.append(f"{where}.{k}: must be a multiple of 8")
+        elif k == "sampling":
+            if v not in IMG_SAMPLERS: errs.append(f"{where}.sampling: not in {sorted(IMG_SAMPLERS)}")
+        elif k == "offload_to_cpu":
+            if not isinstance(v, bool): errs.append(f"{where}.offload_to_cpu: must be true/false")
+
+def validate_images(img, selected=None):
+    """Problems (empty = valid) with the registry's "images" section."""
+    errs = []
+    if not isinstance(img, dict): return ["images: must be an object"]
+    for k in img:
+        if _secretish(k): errs.append(f"images: secret-like field {k!r} not allowed")
+        elif k not in ("defaults", "models", "presets", "note"): errs.append(f"images: unknown key {k!r}")
+    if "note" in img and not isinstance(img["note"], str): errs.append("images.note: must be a string")
+    models = img.get("models")
+    if not isinstance(models, dict) or not models: return errs + ["images.models: must be a non-empty object"]
+    for mid, m in models.items():
+        w = f"images.models.{mid}"
+        if not IMG_ID_RE.match(str(mid)): errs.append(f"{w}: id must match [A-Za-z0-9._-]{{1,64}}")
+        if not isinstance(m, dict): errs.append(f"{w}: must be an object"); continue
+        for k, v in m.items():
+            if _secretish(k): errs.append(f"{w}: secret-like field {k!r} not allowed")
+            elif k in IMG_URLS: _check_url(f"{w}.{k}", v, errs)
+            elif k == "kind":
+                if v not in IMG_KINDS: errs.append(f"{w}.kind: must be one of {list(IMG_KINDS)}")
+            elif k == "note":
+                if not isinstance(v, str): errs.append(f"{w}.note: must be a string")
+            elif k not in IMG_KNOBS: errs.append(f"{w}: unknown key {k!r}")
+        if m.get("kind") not in IMG_KINDS:
+            if "kind" not in m: errs.append(f"{w}: missing kind")
+        else:
+            for k in IMG_REQUIRED[m["kind"]]:
+                if k not in m: errs.append(f"{w}: kind {m['kind']!r} needs {k}")
+        _check_img_knobs(w, {k: v for k, v in m.items() if k in IMG_KNOBS}, errs)
+    d = img.get("defaults", {})
+    if not isinstance(d, dict): errs.append("images.defaults: must be an object")
+    else:
+        for k in d:
+            if _secretish(k): errs.append(f"images.defaults: secret-like field {k!r} not allowed")
+            elif k not in IMG_KNOBS: errs.append(f"images.defaults: unknown key {k!r}")
+        _check_img_knobs("images.defaults", {k: v for k, v in d.items() if k in IMG_KNOBS}, errs)
+    pr = img.get("presets", {})
+    if not isinstance(pr, dict): errs.append("images.presets: must be an object")
+    else:
+        for n, ids in pr.items():
+            if not isinstance(ids, list) or not all(i in models for i in ids):
+                errs.append(f"images.presets.{n}: must be a list of known image ids")
+    for sel in selected or []:
+        if sel not in models and sel not in (pr if isinstance(pr, dict) else {}):
+            errs.append(f"IMAGE_MODELS: unknown id or preset {sel!r}")
+    return errs
+
+def image_selection():
+    return [x.strip() for x in os.environ.get("IMAGE_MODELS", "").split(",") if x.strip()]
+
+def _image_rows(img, selected):
+    ids = []
+    for s in selected:
+        for i in (img.get("presets", {}).get(s) or [s]):
+            if i not in ids: ids.append(i)
+    d = img.get("defaults", {})
+    rows = []
+    for i in ids:
+        m = {**d, **img["models"][i]}
+        flags = []
+        for k, (flag, typ, _lo, _hi) in IMG_NUM.items():
+            if k in m: flags += [flag, str(m[k])]
+        if "sampling" in m: flags += ["--sampling-method", m["sampling"]]
+        if m.get("offload_to_cpu"): flags.append("--offload-to-cpu")
+        rows.append({"id": i, "kind": m["kind"], "note": m.get("note", ""), "flags": flags,
+                     "urls": {k: m[k] for k in IMG_URLS if k in m}})
+    return rows
+
+def load_images():
+    """Rows for the entries named in IMAGE_MODELS, or [] when it is unset or no
+    valid images section exists (fresh file, then the last-good copy). Never
+    raises."""
+    sel = image_selection()
+    if not sel: return []
+    for path, label in ((REGISTRY_FILE, "registry"), (REGISTRY_GOOD, "last-good registry")):
+        try:
+            raw = open(path).read()
+            reg = json.loads(raw)
+            if not isinstance(reg, dict) or "images" not in reg: raise ValueError("no images section")
+            errs = validate_images(reg["images"], sel)
+            if re.search(r"hf_[A-Za-z0-9]{20,}", raw): errs.append("a Hugging Face token appears in the registry")
+        except Exception as e:
+            print(f"[init] ERROR: {label} {path} unusable for images ({e})", flush=True); continue
+        if errs:
+            print(f"[init] ERROR: {label} {path} images section invalid, rejecting it:", flush=True)
+            for e in errs: print(f"[init]   - {e}", flush=True)
+            continue
+        if path == REGISTRY_FILE and not validate_registry(reg):
+            try:
+                tmp = REGISTRY_GOOD + ".tmp"
+                open(tmp, "w").write(raw); os.replace(tmp, REGISTRY_GOOD)
+            except OSError as e:
+                print(f"[init] warn: could not save last-good registry ({e})", flush=True)
+        elif path != REGISTRY_FILE:
+            print(f"[init] WARNING: using {label} for images; the fresh models.json was missing or invalid", flush=True)
+        return _image_rows(reg["images"], sel)
+    print("[init] ERROR: IMAGE_MODELS is set but no valid images section; image generation is DISABLED", flush=True)
+    return []
+
 def load_params(with_source=False):
     """Model list: valid models.json (when MODELS is set) > params.json > env.
-    Settings and embedding still come from params.json/env."""
+    Settings and embedding still come from params.json/env. "images" is the
+    image/video rows from IMAGE_MODELS (never saved to params.json)."""
     p, src = _load_params()
     rows = load_registry()
     if rows is not None:
         p = dict(p, models=rows); src = "registry"
+    p = dict(p, images=load_images())
     return (p, src) if with_source else p
 
 def _load_params():
@@ -316,6 +444,29 @@ def build_config(params):
             lines.append(f'      - "MODEL_ID={mid}"')
             lines.append(f"    cmd: python3 /tmp/serve.py ${{PORT}}")
             lines.append(f"    logFile: /tmp/serve-{mid}.log")
+    # Image/video models: no group is emitted, same as the chat models above, so
+    # they share llama-swap's one default group and swap with the chat models.
+    for r in params.get("images") or []:
+        mid = r["id"]
+        if mid in emitted:
+            print(f"[init] ERROR: image model id {mid!r} clashes with a chat model id; skipped", flush=True)
+            continue
+        emitted.add(mid); found += 1
+        lines.append(f"  {mid!r}:")
+        lines.append(f'    proxy: "http://127.0.0.1:${{PORT}}"')
+        lines.append(f"    env:")
+        for k, v in r["urls"].items():
+            lines.append(f'      - "IMG_URL_{IMG_URLS[k]}={v}"')
+        lines.append(f'      - "IMG_FLAGS={" ".join(r["flags"])}"')
+        for k in PASS_KEYS:
+            v = params.get("settings", {}).get(k)
+            if v and (k.startswith("DOWNLOAD") or k.startswith("HF_")):
+                lines.append(f'      - "{k}={v}"')
+        lines.append(f'      - "MODEL_ID={mid}"')
+        lines.append(f"    cmd: python3 /tmp/imgserve.py ${{PORT}}")
+        lines.append(f"    checkEndpoint: /sdcpp/v1/capabilities")
+        lines.append(f"    ttl: 0")
+        lines.append(f"    logFile: /tmp/serve-{mid}.log")
     return "\n".join(lines) + "\n", found
 
 def write_config(cfg, path="/app/config.yaml"):
