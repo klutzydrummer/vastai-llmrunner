@@ -510,7 +510,7 @@ def pg(path):
                 if k=='general.architecture':arch=rv(f,vt);break
                 else:sv(f,vt)
             except:break
-    W={f'{arch}.{s}' for s in ['block_count','attention.head_count','attention.head_count_kv','embedding_length','feed_forward_length','attention.layer_count','context_length','mtp_depth']}
+    W={f'{arch}.{s}' for s in ['block_count','attention.head_count','attention.head_count_kv','embedding_length','feed_forward_length','attention.layer_count','context_length','mtp_depth','attention.key_length','attention.value_length','attention.key_length_swa','attention.value_length_swa','attention.sliding_window','attention.sliding_window_pattern']}
     meta={'general.architecture':arch}
     with open(path,'rb') as f:
         f.read(4);f.read(4);f.read(8);kv=struct.unpack('<Q',f.read(8))[0]
@@ -522,6 +522,42 @@ def pg(path):
                 if len(meta)==len(W)+1:break
             except:break
     return meta,arch
+def kv_layout(meta,arch,nl,hd,nk):
+    """Per-layer KV geometry as (full_elems, swa_elems, n_swa), elements per token
+    summed over the full-attention layers and over the sliding-window layers
+    (n_head_kv * (key_len + value_len) per layer); None when the GGUF carries no
+    per-layer keys (no sliding_window_pattern, no key_length_swa, scalar
+    head_count_kv), in which case the caller keeps the flat formula.
+    head_count_kv may be a per-layer array (llama.cpp reads it with get_arr_n;
+    UNVERIFIED, llama-model.cpp was not reachable); a scalar applies to every layer."""
+    g=lambda k:meta.get(f'{arch}.{k}')
+    hkv=g('attention.head_count_kv');pat=g('attention.sliding_window_pattern')
+    kls=g('attention.key_length_swa');vls=g('attention.value_length_swa')
+    if not isinstance(hkv,(list,tuple)) and not isinstance(pat,(list,tuple)) and kls is None and vls is None: return None
+    kl=int(g('attention.key_length') or hd);vl=int(g('attention.value_length') or kl)
+    kls=int(kls or kl);vls=int(vls or kls)
+    heads=[int(x) for x in hkv] if isinstance(hkv,(list,tuple)) else [int(hkv if hkv is not None else nk)]*nl
+    heads=(heads+[heads[-1]]*nl)[:nl] if heads else [nk]*nl
+    swa=[bool(x) for x in pat] if isinstance(pat,(list,tuple)) else [False]*nl
+    swa=(swa+[False]*nl)[:nl]
+    full=sum(h*(kl+vl) for h,s in zip(heads,swa) if not s)
+    win=sum(h*(kls+vls) for h,s in zip(heads,swa) if s)
+    return full,win,int(g('attention.sliding_window') or 0)
+
+def kv_ctx_budget(kv_bytes,layout,eb,ub,nl,nkv,nk,hd,swa_full=False,slots=1):
+    """Total context (all slots) that kv_bytes of VRAM holds. Flat formula
+    (every layer caches every token) without a layout. With one: full-attention
+    layers cost full_elems*eb per token of ctx; sliding-window layers keep a
+    fixed cell count per llama-kv-cache-iswa.cpp,
+    min(ctx, GGML_PAD(n_swa*n_seq_max+n_ubatch,256)) with n_seq_max=slots under
+    the unified cache, which is a fixed overhead rather than a per-token cost.
+    --swa-full makes them scale with ctx like the full layers."""
+    if layout is None: return max(0,int(kv_bytes/(2*nkv*nk*hd*eb)))
+    full,win,n_swa=layout
+    if swa_full or n_swa<=0: return max(0,int(kv_bytes/((full+win)*eb)))
+    cells=-(-(n_swa*slots+ub)//256)*256
+    return max(0,int((kv_bytes-win*eb*cells)/(full*eb))) if full else 0
+
 def find_binary():
     for p in ['/app/llama-server','/llama-server']:
         if os.path.isfile(p) and os.access(p,os.X_OK):return p
@@ -643,16 +679,21 @@ if cpd>0:
 else:
     print(f'[serve] warn: rem={rem/1048576:.0f}MB (model may exceed detected VRAM={tv:.0f}MB), using conservative defaults',flush=True)
     ub=512
-kpt=2*nkv*nk*hd*eb;compute_total=ndev*max(nh*ub*ub*4,2*ffn*ub*4)*SAFETY
+compute_total=ndev*max(nh*ub*ub*4,2*ffn*ub*4)*SAFETY
 kv_bytes=max(0,rem)-compute_total
 # Total context the VRAM budget holds across all slots; how it is split into
 # slots is decided further down, once the trained context is known.
-ctx_budget=int(os.environ.get('CTX_SIZE','0')) or max(512,max(0,(int(kv_bytes/kpt)//512)*512))
 ub=int(os.environ.get('UBATCH_SIZE','0')) or ub
 # Vision models: non-causal attention requires ubatch >= image token count
 if mmp and os.path.isfile(mmp):
     img_max=int(os.environ.get('IMAGE_MAX_TOKENS','2240'))
     ub=max(ub,img_max)
+# SWA_FULL=1 passes --swa-full: sliding-window layers then cache the whole ctx.
+# The window cells are budgeted for one slot (the unified cache grows them by
+# n_swa per extra slot, small next to the 12% headroom).
+swa_full=os.environ.get('SWA_FULL','0')=='1'
+kv_lay=kv_layout(meta,arch,nl,hd,nk)
+ctx_budget=int(os.environ.get('CTX_SIZE','0')) or max(512,(kv_ctx_budget(kv_bytes,kv_lay,eb,ub,nl,nkv,nk,hd,swa_full)//512)*512)
 # ── context vs. trained context ───────────────────────────────────────────────
 # The KV budget above can hand a slot more context than the model was trained
 # for; llama-server then either refuses to load or generates gibberish past the
@@ -732,14 +773,18 @@ print(f'[serve] slots: {par} ({slots_src}; auto={slots_auto}, range {slots_min}-
 if not ctx_train_known:
     n_ctx_train=ctx   # GGUF didn't say; keep reporting something sane
 batch=int(os.environ.get('BATCH_SIZE','0')) or ctx
-vram_used_mb=int(wm+pm2+ctx*kpt/1048576+compute_total/1048576)
+if kv_lay and kv_lay[2]>0 and not swa_full: kv_used=kv_lay[0]*eb*ctx+kv_lay[1]*eb*min(ctx,-(-(kv_lay[2]*par+ub)//256)*256)
+elif kv_lay: kv_used=sum(kv_lay[:2])*eb*ctx
+else: kv_used=2*nkv*nk*hd*eb*ctx
+vram_used_mb=int(wm+pm2+kv_used/1048576+compute_total/1048576)
 print(f'[serve] arch={arch} nl={nl} nkv={nkv} nh={nh} nk={nk} hd={hd} ffn={ffn}',flush=True)
 print(f'[serve] ctx={ctx} per_slot={ctx//par} batch={batch} ubatch={ub} par={par}',flush=True)
-print(f'[serve] weights={wm:.0f}MB mmproj={pm2:.0f}MB draft={pdraft:.0f}MB embed={pembed:.0f}MB kv={ctx*kpt/1048576:.0f}MB compute~{compute_total/1048576:.0f}MB',flush=True)
+print(f'[serve] weights={wm:.0f}MB mmproj={pm2:.0f}MB draft={pdraft:.0f}MB embed={pembed:.0f}MB kv={kv_used/1048576:.0f}MB compute~{compute_total/1048576:.0f}MB',flush=True)
 write_status({'status':'loading','model':os.path.basename(mp),'ctx':ctx,'n_ctx_train':n_ctx_train,'n_ctx_per_slot':ctx//par,'vram_mb':vram_used_mb,'par':par,'port':int(PORT),'ts':int(time.time()),'ctx_overflow':co,'ctx_note':ctx_note,'ctx_train_known':ctx_train_known,'model_id':MODEL_ID,'ctx_budget':ctx_budget,'slots_auto':slots_auto,'slots_min':slots_min,'slots_max':slots_max,'slots_src':slots_src})
 args=['--model',mp,'--ctx-size',str(ctx),'--batch-size',str(batch),'--ubatch-size',str(ub),'--parallel',str(par)]
 args+=['--host','0.0.0.0','--port',PORT]
 args+=['--cache-type-k',ct,'--cache-type-v',ctv]
+if swa_full:args+=['--swa-full']
 args+=rope_args
 if mmp and os.path.isfile(mmp):args+=['--mmproj',mmp]
 if os.environ.get('IMAGE_MIN_TOKENS'):args+=['--image-min-tokens',os.environ['IMAGE_MIN_TOKENS']]
