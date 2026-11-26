@@ -528,8 +528,13 @@ def kv_layout(meta,arch,nl,hd,nk):
     (n_head_kv * (key_len + value_len) per layer); None when the GGUF carries no
     per-layer keys (no sliding_window_pattern, no key_length_swa, scalar
     head_count_kv), in which case the caller keeps the flat formula.
-    head_count_kv may be a per-layer array (llama.cpp reads it with get_arr_n;
-    UNVERIFIED, llama-model.cpp was not reachable); a scalar applies to every layer."""
+    head_count_kv may be a per-layer array (verified 2026-11-25: llama.cpp reads
+    it with get_key_or_arr at llama-model.cpp:1680, and the Pantheon GGUF carries
+    one; sliding_window_pattern is a bool array read by src/models/gemma4.cpp);
+    a scalar applies to every layer. See docs/gemma4-kv-primer.md.
+    Note (code reading only, 2026-11-25): Gemma4 full layers have no attn_v
+    tensor (attention_k_eq_v), yet llama-kv-cache.cpp still allocates a V cache
+    for them, so counting separate K and V here is conservative, not an error."""
     g=lambda k:meta.get(f'{arch}.{k}')
     hkv=g('attention.head_count_kv');pat=g('attention.sliding_window_pattern')
     kls=g('attention.key_length_swa');vls=g('attention.value_length_swa')
@@ -656,6 +661,8 @@ if os.path.isfile(_ct_override):
     _v=open(_ct_override).read().strip()
     if _v: ct=ctv=_v
 cf=float(os.environ.get('COMPUTE_FRACTION','0.12'))
+# Bytes per element. Q8_0 = 34 B per 32 elements (1.0625) is UNVERIFIED: from
+# general ggml knowledge, block_q8_0 was not read (checked 2026-11-25).
 eb={'f16':2.0,'q8_0':1.0625,'q4_0':0.5,'q4_1':0.5625,'f32':4.0,'q5_0':0.625,'q5_1':0.6875}.get(ct,2.0)
 wm=os.path.getsize(mp)/1048576*1.05
 pm2=os.path.getsize(mmp)/1048576*1.02 if mmp and os.path.isfile(mmp) else 0
