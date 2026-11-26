@@ -32,6 +32,8 @@ def pantheon_ctx(vram_gib,**kw):
 
 class T(unittest.TestCase):
     def test_gemma4_layout_bytes_per_token(self):
+        # Layout facts verified 2026-11-25, see docs/gemma4-kv-primer.md.
+        # Only the Q8_0 = 34 B/32 elems (1.0625) factor remains unverified.
         full,win,n=lay(gemma4_meta())
         self.assertEqual((full,win,n),(5*2*1024,25*8*512,1024))
         self.assertAlmostEqual(full*1.0625,10880); self.assertAlmostEqual(win*1.0625,108800)
