@@ -21,7 +21,13 @@ PORT = int(os.environ.get("VIDEOTEST_PORT", "18810"))
 
 def load_endpoints():
     with open(os.path.join(HERE, "endpoints.json")) as f:
-        return json.load(f)
+        eps = json.load(f)
+    # VIDEOTEST_BASE_<NAME> overrides a preset's base URL (e.g. in a container).
+    for n, v in eps.items():
+        o = os.environ.get("VIDEOTEST_BASE_" + n.upper().replace("-", "_"))
+        if o and v.get("base") is not None:
+            v["base"] = o
+    return eps
 
 
 def resolve(ep_name, query, headers):
