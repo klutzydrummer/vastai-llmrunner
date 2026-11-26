@@ -109,7 +109,7 @@ class T(unittest.TestCase):
         self.assertEqual(self.ns['remote_size'](s.url),100)
 
     def test_lock_serializes_second_downloader(self):
-        s=self.serve(b'x'*100); dest=self.dest(s.url)
+        s=self.serve(b'x'*100)
         calls=[]
         orig=self.ns['_dl_locked']
         def slow(*a):
