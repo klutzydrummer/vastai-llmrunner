@@ -26,7 +26,156 @@ def _env_params():
     embedding = {k: os.environ.get(k, "") for k in EMBED_KEYS}
     return {"models": models, "settings": settings, "embedding": embedding}
 
+# ── repo model registry (models.json) ────────────────────────────────────────
+# init.sh fetches models.json next to the scripts. Selected with MODELS=id1,id2
+# (ids or preset names). Only active when MODELS is set; then a valid registry
+# beats params.json and the MODEL_URL* env vars for the model list.
+REGISTRY_FILE = os.environ.get("MODELS_FILE", "/tmp/models.json")
+REGISTRY_GOOD = "/app/models.json.good"
+CACHE_TYPES = {"f32","f16","bf16","q8_0","q4_0","q4_1","iq4_nl","q5_0","q5_1"}
+# registry knob -> env var serve.py reads
+KNOBS = {"cache_type_k":"CACHE_TYPE_K","cache_type_v":"CACHE_TYPE_V","ctx_size":"CTX_SIZE",
+         "gpu_layers":"GPU_LAYERS","fit":"FIT","ctx_overflow":"CTX_OVERFLOW","no_mtp":"NO_MTP"}
+DEFAULT_ONLY = {"image_min_tokens":"IMAGE_MIN_TOKENS","image_max_tokens":"IMAGE_MAX_TOKENS",
+                "mtmd_batch_max_tokens":"MTMD_BATCH_MAX_TOKENS","mlock":"MLOCK"}
+URLS = {"url":"model_url","mmproj":"mmproj_url","draft":"draft_model_url"}
+SECRET_WORDS = {"token","secret","password","passwd","credential","credentials","apikey","auth","bearer"}
+
+def _secretish(key):
+    w = {x for x in re.split(r"[^a-z0-9]+", key.lower()) if x}
+    return bool(w & SECRET_WORDS) or "apikey" in key.lower().replace("_", "")
+
+def _check_url(where, u, errs):
+    if not isinstance(u, str) or not u.startswith("https://"):
+        errs.append(f"{where}: must be an https:// url"); return
+    rest = u[8:].split("/")[0]
+    if "@" in rest or re.search(r"[?&](token|key|secret|sig|auth)[a-z_]*=", u, re.I):
+        errs.append(f"{where}: url carries credentials")
+
+def _check_knobs(where, d, allowed, errs):
+    for k, v in d.items():
+        if k in ("note", *URLS) and where != "defaults":
+            continue
+        if _secretish(k):
+            errs.append(f"{where}: secret-like field {k!r} not allowed"); continue
+        if k not in allowed:
+            errs.append(f"{where}: unknown key {k!r}"); continue
+        if k in ("cache_type_k", "cache_type_v", "cache_type"):
+            if v not in CACHE_TYPES: errs.append(f"{where}.{k}: {v!r} not in {sorted(CACHE_TYPES)}")
+        elif k in ("ctx_size", "gpu_layers", "image_min_tokens", "image_max_tokens", "mtmd_batch_max_tokens"):
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0: errs.append(f"{where}.{k}: must be a non-negative integer")
+        elif k == "fit":
+            if v not in ("auto", "on", "off"): errs.append(f"{where}.fit: must be auto|on|off")
+        elif k == "ctx_overflow":
+            if v not in ("clamp", "yarn", "linear", "none"): errs.append(f"{where}.ctx_overflow: must be clamp|yarn|linear|none")
+        elif k in ("no_mtp", "mlock"):
+            if not isinstance(v, bool): errs.append(f"{where}.{k}: must be true/false")
+
+def validate_registry(reg, selected=None):
+    """Return a list of problems (empty = valid). `selected` is the MODELS list."""
+    errs = []
+    if not isinstance(reg, dict): return ["top level must be an object"]
+    for k in reg:
+        if _secretish(k): errs.append(f"secret-like top-level field {k!r} not allowed")
+        elif k not in ("models", "defaults", "presets", "note"): errs.append(f"unknown top-level key {k!r}")
+    models = reg.get("models")
+    if not isinstance(models, dict) or not models: return errs + ["'models' must be a non-empty object"]
+    knobs = set(KNOBS) | {"cache_type"}
+    for mid, m in models.items():
+        w = f"models.{mid}"
+        if not isinstance(m, dict): errs.append(f"{w}: must be an object"); continue
+        if "url" not in m: errs.append(f"{w}: missing url"); continue
+        for k in URLS:
+            if k in m and (k == "url" or m[k]): _check_url(f"{w}.{k}", m[k], errs)
+        if isinstance(m["url"], str) and model_stem(m["url"]) != mid:
+            errs.append(f"{w}: id must equal the url's file stem {model_stem(m['url'])!r}")
+        if "note" in m and not isinstance(m["note"], str): errs.append(f"{w}.note: must be a string")
+        _check_knobs(w, {k: v for k, v in m.items() if k not in ("note", *URLS)}, knobs, errs)
+    d = reg.get("defaults", {})
+    if not isinstance(d, dict): errs.append("defaults: must be an object")
+    else: _check_knobs("defaults", d, knobs | set(DEFAULT_ONLY), errs)
+    pr = reg.get("presets", {})
+    if not isinstance(pr, dict): errs.append("presets: must be an object")
+    else:
+        for n, ids in pr.items():
+            if not isinstance(ids, list) or not all(i in models for i in ids):
+                errs.append(f"presets.{n}: must be a list of known model ids")
+    for sel in selected or []:
+        if sel not in models and sel not in (pr if isinstance(pr, dict) else {}):
+            errs.append(f"MODELS: unknown id or preset {sel!r}")
+    for s in re.findall(r"hf_[A-Za-z0-9]{20,}", json.dumps(reg)):
+        errs.append("a Hugging Face token appears in the registry"); break
+    return errs
+
+def registry_selection():
+    return [x.strip() for x in os.environ.get("MODELS", "").split(",") if x.strip()]
+
+def registry_active():
+    return bool(registry_selection())
+
+def _registry_rows(reg, selected):
+    ids = []
+    for s in selected:
+        for i in (reg.get("presets", {}).get(s) or [s]):
+            if i not in ids: ids.append(i)
+    d = reg.get("defaults", {})
+    rows = []
+    for i in ids:
+        m = reg["models"][i]
+        def expand(b):  # cache_type shorthand sets both; explicit _k/_v in the same block wins
+            o = {k: v for k, v in b.items() if k != "cache_type"}
+            if "cache_type" in b:
+                for k in ("cache_type_k", "cache_type_v"): o.setdefault(k, b["cache_type"])
+            return o
+        merged = {**expand(d), **expand(m)}
+        env = {}
+        for k, v in merged.items():
+            e = KNOBS.get(k) or DEFAULT_ONLY.get(k)
+            if e: env[e] = ("1" if v else "0") if isinstance(v, bool) else str(v)
+        if env.get("NO_MTP") == "0": del env["NO_MTP"]
+        rows.append({"model_url": m["url"], "mmproj_url": m.get("mmproj", ""),
+                     "draft_model_url": m.get("draft", ""), "env": env, "note": m.get("note", "")})
+    return rows
+
+def load_registry():
+    """Rows from models.json for the models named in MODELS, or None when MODELS
+    is unset or no valid registry (fresh copy, then last-good copy) exists. Never
+    raises: a bad registry must not stop llama-swap from starting."""
+    sel = registry_selection()
+    if not sel: return None
+    for path, label in ((REGISTRY_FILE, "registry"), (REGISTRY_GOOD, "last-good registry")):
+        try:
+            raw = open(path).read()
+            reg = json.loads(raw)
+            errs = validate_registry(reg, sel)
+        except Exception as e:
+            print(f"[init] ERROR: {label} {path} unusable ({e})", flush=True); continue
+        if errs:
+            print(f"[init] ERROR: {label} {path} invalid, rejecting it:", flush=True)
+            for e in errs: print(f"[init]   - {e}", flush=True)
+            continue
+        if path == REGISTRY_FILE:
+            try:
+                tmp = REGISTRY_GOOD + ".tmp"
+                open(tmp, "w").write(raw); os.replace(tmp, REGISTRY_GOOD)
+            except OSError as e:
+                print(f"[init] warn: could not save last-good registry ({e})", flush=True)
+        else:
+            print(f"[init] WARNING: using {label}; the fresh models.json was missing or invalid", flush=True)
+        return _registry_rows(reg, sel)
+    print("[init] ERROR: MODELS is set but no valid registry; falling back to params.json/env models", flush=True)
+    return None
+
 def load_params(with_source=False):
+    """Model list: valid models.json (when MODELS is set) > params.json > env.
+    Settings and embedding still come from params.json/env."""
+    p, src = _load_params()
+    rows = load_registry()
+    if rows is not None:
+        p = dict(p, models=rows); src = "registry"
+    return (p, src) if with_source else p
+
+def _load_params():
     """Params saved via the cfgedit UI (/app/params.json) take priority over
     the container's env vars, mirroring the /app/downloader and /app/cache_type
     override files. Falls back to env vars (MODEL_URL, MODEL_URL_2, ...) only
@@ -47,11 +196,10 @@ def load_params(with_source=False):
                 p.setdefault("embedding", {})
                 for k in EMBED_KEYS:
                     p["embedding"].setdefault(k, os.environ.get(k, ""))
-                return (p, PARAMS_FILE) if with_source else p
+                return p, PARAMS_FILE
         except Exception as e:
             print(f"[init] warn: {PARAMS_FILE} unusable ({e}), falling back to env", flush=True)
-    p = _env_params()
-    return (p, source) if with_source else p
+    return _env_params(), source
 
 def save_params(params):
     models = []
@@ -156,9 +304,13 @@ def build_config(params):
             lines.append(f'      - "DRAFT_MODEL_URL={DMU if use_dm else ""}"')
             if no_mtp:
                 lines.append(f'      - "NO_MTP=1"')
+            own = m.get("env") or {}
+            for k, v in own.items():
+                if k != "NO_MTP" or not no_mtp:
+                    lines.append(f'      - "{k}={v}"')
             for k in PASS_KEYS:
                 v = params.get("settings", {}).get(k)
-                if v:
+                if v and k not in own:
                     lines.append(f'      - "{k}={v}"')
             lines.append(f'      - "PARALLEL=auto"')
             lines.append(f'      - "MODEL_ID={mid}"')

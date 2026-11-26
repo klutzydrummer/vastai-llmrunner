@@ -33,8 +33,8 @@ DL_PARALLEL_DEFAULT=1
 EXPOSE_ACTIVE_ONLY_FILE='/app/expose_active_only'
 TRUTHY={'1','true','yes','on'}
 LLAMA_SWAP_HOST='localhost'; LLAMA_SWAP_PORT=8080
-SCRIPTS_BASE='https://raw.githubusercontent.com/klutzydrummer/vastai-llmrunner/main'
-SCRIPTS=['serve.py','cfgedit.py','guard.py','cfginit.py','embed.py','init.sh']
+SCRIPTS_BASE='https://raw.githubusercontent.com/klutzydrummer/vastai-llmrunner/'+(os.environ.get('REPO_REF') or 'main')
+SCRIPTS=['serve.py','cfgedit.py','guard.py','cfginit.py','embed.py','init.sh','models.json']
 EMBED_STATUS='/tmp/embed_status.json'
 # Outcome of the last "Update Scripts" run, read back by the UI after the
 # editor re-execs so it can say which files actually changed.
@@ -531,14 +531,15 @@ class H(BaseHTTPRequestHandler):
         elif self.path=='/params':
             try:
                 before=cfginit.load_params().get('embedding',{})
-                params=cfginit.save_params(json.loads(body.decode()))
+                cfginit.save_params(json.loads(body.decode()))
+                params,_src=cfginit.load_params(with_source=True)  # registry (MODELS) still wins for the model list
                 cfg,found=cfginit.build_config(params)
                 cfginit.write_config(cfg,CONFIG)
                 unload_all()
                 if params.get('embedding',{})!=before:
                     threading.Thread(target=restart_embed,daemon=True).start()
                 print(f'[cfgedit] params saved, regenerated config with {found} model(s)',flush=True)
-                saved=dict(params); saved['source']=cfginit.PARAMS_FILE
+                saved=dict(params); saved['source']='registry' if _src=='registry' else cfginit.PARAMS_FILE
                 self.ok(json.dumps({'config':cfg,'params':saved}).encode(),'application/json')
             except Exception as e:
                 self.send_response(400);self.end_headers();self.wfile.write(str(e).encode())
@@ -581,8 +582,9 @@ class H(BaseHTTPRequestHandler):
                                       ('3','3'),('4','4'),('6','6'),('8','8')])
         _sp,params_src=cfginit.load_params(with_source=True)
         params_note=('saved params ('+str(len(_sp.get('models') or []))+' model'
-                     +('' if len(_sp.get('models') or [])==1 else 's')+')') if params_src!='env' \
-                    else 'container env defaults'
+                     +('' if len(_sp.get('models') or [])==1 else 's')+')') if params_src not in ('env','registry') \
+                    else 'container env defaults' if params_src=='env' \
+                    else 'models.json registry (MODELS='+os.environ.get('MODELS','')+') &mdash; authoritative, model edits here are ignored'
         model_ids=get_model_ids()
         dm_opts=f'<option value="" {"selected" if not cur_dm else ""}>env default</option>'
         dm_opts+=''.join(f'<option value="{m}" {"selected" if cur_dm==m else ""}>{m}</option>' for m in model_ids)
@@ -915,7 +917,7 @@ function saveParams(){{
       renderParams(d.params);
       refreshModels();
       var n=(d.params.models||[]).length;
-      pm.textContent='✓ saved '+n+' model'+(n===1?'':'s')+' & regenerated';
+      pm.textContent=d.params.source==='registry'?'✓ settings saved; models come from models.json (MODELS is set), so your model rows were ignored':'✓ saved '+n+' model'+(n===1?'':'s')+' & regenerated';
     }})
     .catch(e=>pm.textContent='✗ '+e);
 }}

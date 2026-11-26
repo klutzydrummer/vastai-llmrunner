@@ -249,6 +249,38 @@ written — it is not treated as "unset", which would silently bring the env
 models back over what was just saved. Saving an empty table asks for
 confirmation first.
 
+## Repo model registry (`models.json`)
+
+`models.json` at the repo root lists known models. `init.sh` fetches it with the
+scripts on every boot (and **Update Scripts** refreshes it). It is used only when
+the container env var `MODELS=id1,id2` is set; ids are the GGUF file stem, or a
+name from `presets`. `DEFAULT_MODEL` works as before.
+
+**Precedence for the model list.** `MODELS` set and registry valid: `models.json`
+> `/app/params.json` > `MODEL_URL*` env. `MODELS` unset: unchanged (params.json >
+env). Registry models are *not* re-masked by params.json: their per-model knobs
+(`cache_type[_k/_v]`, `ctx_size`, `gpu_layers`, `fit`, `ctx_overflow`, `no_mtp`,
+merged over the top-level `defaults`) override the global **Settings** for that
+model; other settings still come from params.json/env. While `MODELS` is active
+the editor shows the registry as authoritative; edits to the model rows are
+ignored on save (Settings and Embeddings still save).
+
+Entry fields: `url` (required), `mmproj`, `draft`, the knobs above, `note`.
+`defaults` also accepts `image_min_tokens`, `image_max_tokens`,
+`mtmd_batch_max_tokens`, `mlock`. Only https URLs; unknown keys and any
+token/secret-like field (the container env keeps `HF_TOKEN`) are rejected.
+
+**Failure behaviour.** The registry is validated at boot. If it is missing or
+invalid, cfginit logs the problems loudly, then uses the last good copy
+(`/app/models.json.good`, written after each successful validation), then
+params.json/env. It never exits, so llama-swap still starts.
+
+**Pinning.** `REPO_REF` (default `main`) selects the branch, tag or commit the
+scripts and `models.json` are fetched from, e.g. `REPO_REF=v1.2`. `init.sh`
+itself must be fetched by the template's onstart; add `models.json` to that
+fetch list too, or the first boot after enabling `MODELS` relies on the
+`init.sh` fetch.
+
 ## Configuring the embedding model
 
 In `/editor` → **Embeddings**, choose a preset or paste any GGUF URL, then

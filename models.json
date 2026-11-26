@@ -1,0 +1,33 @@
+{
+  "note": "Model registry. Select with MODELS=id1,id2 (ids or preset names); DEFAULT_MODEL picks the boot model. Ids are the GGUF file stem. No secrets here: HF_TOKEN stays in the container env.",
+  "defaults": {
+    "cache_type": "q8_0",
+    "gpu_layers": 99,
+    "ctx_overflow": "yarn",
+    "image_min_tokens": 1024,
+    "image_max_tokens": 1024
+  },
+  "presets": {
+    "all": ["Gryphe_Pantheon-Reasoning-26B-A4B-1.1-V2-Q8_0", "gemma-4-12B-it-heretic-Q8_0", "TheDrummer_Artemis-31B-v1.2-Q8_0"]
+  },
+  "models": {
+    "Gryphe_Pantheon-Reasoning-26B-A4B-1.1-V2-Q8_0": {
+      "url": "https://huggingface.co/bartowski/Gryphe_Pantheon-Reasoning-26B-A4B-1.1-V2-GGUF/resolve/main/Gryphe_Pantheon-Reasoning-26B-A4B-1.1-V2-Q8_0.gguf",
+      "mmproj": "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/main/mmproj-BF16.gguf",
+      "draft": "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/main/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf",
+      "note": "2026-11-25. bartowski quant (27.6 GB) of a Gemma-4-26B-A4B finetune; base-model unsloth mmproj (bartowski has none). Draft is the unsloth 26B-A4B MTP, not in the old template; HTTP 200 checked, MTP acceptance with this finetune unmeasured."
+    },
+    "gemma-4-12B-it-heretic-Q8_0": {
+      "url": "https://huggingface.co/igorls/gemma-4-12B-it-heretic-GGUF/resolve/main/gemma-4-12B-it-heretic-Q8_0.gguf",
+      "mmproj": "https://huggingface.co/unsloth/gemma-4-12b-it-GGUF/resolve/main/mmproj-BF16.gguf",
+      "draft": "https://huggingface.co/unsloth/gemma-4-12b-it-GGUF/resolve/main/MTP/mtp-gemma-4-12b-it-Q8_0.gguf",
+      "note": "2026-11-25. igorls heretic (abliterated) Q8_0, 12.7 GB; mmproj and MTP from unsloth's base 12b repo, as in the previous template."
+    },
+    "TheDrummer_Artemis-31B-v1.2-Q8_0": {
+      "url": "https://huggingface.co/bartowski/TheDrummer_Artemis-31B-v1.2-GGUF/resolve/main/TheDrummer_Artemis-31B-v1.2-Q8_0.gguf",
+      "mmproj": "https://huggingface.co/bartowski/TheDrummer_Artemis-31B-v1.2-GGUF/resolve/main/mmproj-TheDrummer_Artemis-31B-v1.2-bf16.gguf",
+      "draft": "https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main/MTP/mtp-gemma-4-31B-it-Q8_0.gguf",
+      "note": "2026-11-25. bartowski Q8_0 (32.6 GB) of Gemma-4-31B finetune with its own fine-tuned mmproj; draft is the base unsloth 31B MTP (acceptance with the finetune unmeasured)."
+    }
+  }
+}
