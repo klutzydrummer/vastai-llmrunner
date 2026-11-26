@@ -678,6 +678,17 @@ def _embed_reserve_mb():
     return 0.0
 pembed=_embed_reserve_mb()
 if pembed: print(f'[serve] reserving {pembed:.0f}MB VRAM for embeddings sidecar',flush=True)
+BATCH_CAP=4096
+def batch_cap(ctx,ub):
+    """--batch-size: never above BATCH_CAP, never below ubatch, never above ctx.
+    llama.cpp splits a batch into ubatches, so a batch of ctx tokens buys no speed
+    (RUN-1 passed 1,238,016) and only inflates per-batch buffers."""
+    return min(ctx,max(ub,BATCH_CAP))
+def draft_compute_bytes(nh,ffn,ub,safety):
+    """Compute buffer reserved for the MTP/draft context, which allocates its own
+    graph at the same ubatch. Uses the target's nh/ffn as a conservative stand-in
+    for the draft's (UNVERIFIED: not measured on a GPU, see docs/known-issues.md)."""
+    return max(nh*ub*ub*4,2*ffn*ub*4)*safety
 ndev=max(len(vrams),1);rem=(tv*0.88-wm-pm2-pdraft-pembed)*1048576
 SAFETY=3.0;cpd=max(0.0,rem)*cf/ndev
 if cpd>0:
@@ -687,6 +698,7 @@ else:
     print(f'[serve] warn: rem={rem/1048576:.0f}MB (model may exceed detected VRAM={tv:.0f}MB), using conservative defaults',flush=True)
     ub=512
 compute_total=ndev*max(nh*ub*ub*4,2*ffn*ub*4)*SAFETY
+if pdraft: compute_total+=draft_compute_bytes(nh,ffn,ub,SAFETY)
 kv_bytes=max(0,rem)-compute_total
 # Total context the VRAM budget holds across all slots; how it is split into
 # slots is decided further down, once the trained context is known.
@@ -779,7 +791,7 @@ print(f'[serve] slots: {par} ({slots_src}; auto={slots_auto}, range {slots_min}-
       +(f' — {ctx_note}' if ctx_note else ''),flush=True)
 if not ctx_train_known:
     n_ctx_train=ctx   # GGUF didn't say; keep reporting something sane
-batch=int(os.environ.get('BATCH_SIZE','0')) or ctx
+batch=int(os.environ.get('BATCH_SIZE','0')) or batch_cap(ctx,ub)
 if kv_lay and kv_lay[2]>0 and not swa_full: kv_used=kv_lay[0]*eb*ctx+kv_lay[1]*eb*min(ctx,-(-(kv_lay[2]*par+ub)//256)*256)
 elif kv_lay: kv_used=sum(kv_lay[:2])*eb*ctx
 else: kv_used=2*nkv*nk*hd*eb*ctx

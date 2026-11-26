@@ -5,9 +5,9 @@ import ast,math,os,sys,unittest
 from unittest import mock
 ROOT=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC=open(os.path.join(ROOT,'serve.py')).read()
-NS={'math':math}
+NS={'math':math,'BATCH_CAP':4096}
 for n in ast.parse(SRC).body:
-    if isinstance(n,ast.FunctionDef) and n.name in ('kv_layout','kv_ctx_budget'): exec(compile(ast.Module([n],[]),'serve.py','exec'),NS)
+    if isinstance(n,ast.FunctionDef) and n.name in ('kv_layout','kv_ctx_budget','batch_cap','draft_compute_bytes'): exec(compile(ast.Module([n],[]),'serve.py','exec'),NS)
 a=SRC.index("ub=int(os.environ.get('UBATCH_SIZE'");b=SRC.index('\n',SRC.index('ctx_budget=int(os.environ.get'))
 BLOCK=SRC[a:b]
 GIB=1<<30
@@ -31,6 +31,20 @@ def pantheon_ctx(vram_gib,**kw):
     return NS['kv_ctx_budget'](rem-compute,lay(gemma4_meta()),1.0625,2240,30,30,8,176,**kw)
 
 class T(unittest.TestCase):
+    def test_batch_not_ctx(self):
+        # RUN-1 set --batch-size == ctx == 1,238,016; must be capped now
+        self.assertEqual(NS['batch_cap'](1238016,2240),4096)
+        self.assertNotEqual(NS['batch_cap'](1238016,2048),1238016)
+        self.assertEqual(NS['batch_cap'](1024,512),1024)       # small ctx: batch == ctx
+        self.assertGreaterEqual(NS['batch_cap'](1238016,8192),8192)  # >= ubatch
+
+    def test_draft_compute_term(self):
+        d=NS['draft_compute_bytes'](16,2112,2048,3.0)
+        self.assertGreater(d,0)
+        self.assertGreater(d,NS['draft_compute_bytes'](16,2112,512,3.0))  # scales with ubatch
+        self.assertIn("if pdraft: compute_total+=draft_compute_bytes",SRC)
+
+
     def test_gemma4_layout_bytes_per_token(self):
         # Layout facts verified 2026-11-25, see docs/gemma4-kv-primer.md.
         # Only the Q8_0 = 34 B/32 elems (1.0625) factor remains unverified.
