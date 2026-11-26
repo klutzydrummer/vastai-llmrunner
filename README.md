@@ -418,3 +418,6 @@ Suggested small models — all good quality for their size:
 **Test** in the Embeddings section runs a real request and reports the vector
 dimension; **Restart embeddings** reloads the sidecar without touching the chat
 model.
+
+- [Dead-man guard](docs/deadman.md): auto-destroy a Vast instance at a deadline.
+- [Known issues](docs/known-issues.md): open problems, each labelled observed or hypothesis.
