@@ -1,4 +1,4 @@
-import os,sys,struct,math,shutil,subprocess as sp,urllib.request,json,time,threading
+import os,sys,struct,math,shutil,subprocess as sp,urllib.request,json,time,threading,fcntl
 PORT=sys.argv[1]
 MODEL_URL=os.environ['MODEL_URL']
 MMPROJ_URL=os.environ.get('MMPROJ_URL','')
@@ -30,6 +30,12 @@ def _int_setting(name,default,lo,hi,override_file=None):
 # once when a model brings an mmproj and/or a draft model along.
 DOWNLOAD_CONNECTIONS=_int_setting('DOWNLOAD_CONNECTIONS',16,1,16,'/app/download_connections')
 DOWNLOAD_PARALLEL=_int_setting('DOWNLOAD_PARALLEL',1,1,8,'/app/download_parallel')
+# aria2c transfer limits. The defaults are aria2's own (60 s connect, 60 s
+# transfer, no minimum speed); the env vars let a slow host tighten them so a
+# dead connection fails fast and the retry loop below takes over.
+DOWNLOAD_CONNECT_TIMEOUT=_int_setting('DOWNLOAD_CONNECT_TIMEOUT',60,1,600)
+DOWNLOAD_TIMEOUT=_int_setting('DOWNLOAD_TIMEOUT',60,1,600)
+DOWNLOAD_LOWEST_SPEED=_int_setting('DOWNLOAD_LOWEST_SPEED',0,0,1<<30)  # bytes/s, 0 = off
 MODEL_DIR='/models'
 STATUS='/tmp/serve_status.json'
 os.makedirs(MODEL_DIR,exist_ok=True)
@@ -78,11 +84,55 @@ def _try_remove(*paths):
             if os.path.exists(p): os.remove(p)
         except: pass
 
+def aria2_cmd(part,url):
+    """aria2c command for one file written to `part`. The .part name is
+    ours alone, so overwriting is safe (aria2 still resumes when its control
+    file exists) and auto-renaming must stay off or a stale file would make
+    aria2c write 'name.1.part' instead."""
+    cmd=['aria2c',f'-x{DOWNLOAD_CONNECTIONS}',f'-s{DOWNLOAD_CONNECTIONS}',
+         '-k10M','--file-allocation=none',
+         '--allow-overwrite=true','--auto-file-renaming=false',
+         f'--connect-timeout={DOWNLOAD_CONNECT_TIMEOUT}',f'--timeout={DOWNLOAD_TIMEOUT}',
+         f'--lowest-speed-limit={DOWNLOAD_LOWEST_SPEED}',
+         '--summary-interval=30','--show-console-readout=false',
+         '-d',os.path.dirname(part),'-o',os.path.basename(part),url]
+    if HF_TOKEN: cmd+=[f'--header=Authorization: Bearer {HF_TOKEN}']
+    return cmd
+
+def _sidecars(dest):
+    """aria2 control files that mean a download was cut short."""
+    return (f'{dest}.aria2',f'{dest}.part.aria2')
+
+def _heal_startup():
+    """Files left behind by a killed run: a model with an .aria2 sibling is a
+    partial download that older versions wrote straight to the final path."""
+    try: names=os.listdir(MODEL_DIR)
+    except OSError: return
+    for f in names:
+        if not f.endswith('.aria2') or f.endswith('.part.aria2'): continue
+        dest=os.path.join(MODEL_DIR,f[:-len('.aria2')])
+        if os.path.isfile(dest):
+            print(f'[serve] removing incomplete download: {os.path.basename(dest)}',flush=True)
+        _try_remove(dest,dest+'.aria2')
+
+_heal_startup()
+
+class _LinkedSize(urllib.request.HTTPRedirectHandler):
+    """HuggingFace answers the HEAD with a 302 carrying X-Linked-Size (the real
+    file size); the redirect target's own Content-Length is the fallback."""
+    linked=None
+    def redirect_request(self,req,fp,code,msg,headers,newurl):
+        v=headers.get('X-Linked-Size')
+        if v and v.isdigit(): self.linked=int(v)
+        return super().redirect_request(req,fp,code,msg,headers,newurl)
+
 def remote_size(url):
     try:
         req=urllib.request.Request(url,method='HEAD')
         if HF_TOKEN: req.add_header('Authorization',f'Bearer {HF_TOKEN}')
-        with urllib.request.urlopen(req,timeout=15) as r:
+        h=_LinkedSize()
+        with urllib.request.build_opener(h).open(req,timeout=15) as r:
+            if h.linked: return h.linked
             cl=r.headers.get('Content-Length')
             return int(cl) if cl else None
     except: return None
@@ -206,32 +256,38 @@ def ensure_space(needed_bytes,keep):
         print(f'[serve] disk after eviction: {shutil.disk_usage(MODEL_DIR).free//1048576}MB free',flush=True)
 
 def dl(url,keep):
+    """Download under a per-file lock, so a second serve.py fetching the same
+    file waits here and then finds it cached."""
     import hashlib
     name=url.split('/')[-1]
     dest=f'{MODEL_DIR}/{hashlib.md5(url.encode()).hexdigest()[:8]}_{name}'
-    if os.path.isfile(dest):
+    with open(dest+'.lock','a+') as lk:
+        try: fcntl.flock(lk,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except OSError:
+            print(f'[serve] waiting for concurrent download of {name}',flush=True)
+            fcntl.flock(lk,fcntl.LOCK_EX)
+        return _dl_locked(url,keep,name,dest)
+
+def _dl_locked(url,keep,name,dest):
+    part=dest+'.part'
+    sz=remote_size(url)
+    # cached only if complete: no control file, and the size matches when known
+    if (os.path.isfile(dest) and not any(os.path.exists(c) for c in _sidecars(dest))
+            and (not sz or os.path.getsize(dest)==sz)):
         print(f'[serve] cached: {name}',flush=True)
         sz_mb=os.path.getsize(dest)//1048576
         set_progress(name,status='cached',pct=100.0,done_mb=sz_mb,size_mb=sz_mb)
         write_status({'status':'cached','model':name,'ts':int(time.time())})
         return dest
-    # Wait for a concurrent download of the same file (aria2 sidecar only, not .cache dir)
-    t0=time.time()
-    while os.path.exists(f'{dest}.aria2') and not os.path.isfile(dest):
-        if time.time()-t0>600: break
-        if int(time.time()-t0)%30==0:
-            print(f'[serve] waiting for concurrent download of {name} ({int(time.time()-t0)}s)',flush=True)
-        time.sleep(5)
-    if os.path.isfile(dest):
-        print(f'[serve] appeared after wait: {name}',flush=True)
-        sz_mb=os.path.getsize(dest)//1048576
-        set_progress(name,status='cached',pct=100.0,done_mb=sz_mb,size_mb=sz_mb)
-        write_status({'status':'cached','model':name,'ts':int(time.time())})
-        return dest
-    sz=remote_size(url)
+    if os.path.exists(dest):
+        print(f'[serve] {name} is incomplete or the wrong size, downloading again',flush=True)
+    _try_remove(dest,f'{dest}.aria2')
+    # a .part resumes only with its control file; without one aria2c would
+    # write a renamed copy next to it
+    if not os.path.exists(f'{part}.aria2'): _try_remove(part)
     sz_mb=sz//1048576 if sz else 0
     if sz:
-        _reserved[dest]=sz
+        _reserved[part]=sz
         ensure_space(sz,keep)
     else: print(f'[serve] could not determine remote size for {name}, proceeding',flush=True)
     print(f'[serve] downloading: {name} ({sz_mb}MB) via {DOWNLOADER} x{DOWNLOAD_CONNECTIONS}',flush=True)
@@ -243,6 +299,8 @@ def dl(url,keep):
     import pty,select,errno
 
     class StallError(Exception): pass
+
+    def _cleanup(): _try_remove(dest,*_sidecars(dest),part)
 
     def run_streaming(cmd,stall_timeout=120):
         out_r,out_w=pty.openpty()
@@ -303,7 +361,7 @@ def dl(url,keep):
             safe=[c if not c.startswith('--header=Authorization') else '--header=Authorization: Bearer [REDACTED]' for c in cmd]
             raise sp.CalledProcessError(rc,safe)
 
-    prog=Progress(name,dest,sz).start()
+    prog=Progress(name,part,sz).start()
     delay=30; last_exc=None
     try:
         for attempt in range(1,DOWNLOAD_MAX_ATTEMPTS+1):
@@ -329,21 +387,22 @@ def dl(url,keep):
                     if out and out!=dest and os.path.isfile(out) and not os.path.isfile(dest):
                         os.rename(out,dest)
                 else:
-                    cmd=['aria2c',f'-x{DOWNLOAD_CONNECTIONS}',f'-s{DOWNLOAD_CONNECTIONS}',
-                         '-k10M','--file-allocation=none',
-                         '--summary-interval=30','--show-console-readout=false',
-                         '-d',MODEL_DIR,'-o',os.path.basename(dest),url]
-                    if HF_TOKEN: cmd+=[f'--header=Authorization: Bearer {HF_TOKEN}']
+                    cmd=aria2_cmd(part,url)
                     run_streaming(cmd)
+                    have=os.path.getsize(part) if os.path.isfile(part) else -1
+                    if have<0 or os.path.exists(f'{part}.aria2') or (sz and have!=sz):
+                        _try_remove(part,f'{part}.aria2')
+                        raise StallError(f'download incomplete ({have} of {sz or "?"} bytes)')
+                    os.replace(part,dest)
                 last_exc=None; break  # success
 
             except StallError as e:
                 last_exc=e
                 if attempt>=DOWNLOAD_MAX_ATTEMPTS:
-                    _try_remove(dest,f'{dest}.aria2'); break
+                    _cleanup(); break
                 if attempt==DOWNLOAD_MAX_ATTEMPTS-1:
                     # penultimate attempt: clear control file so next is a fresh start
-                    _try_remove(f'{dest}.aria2')
+                    _try_remove(part,f'{part}.aria2')
                     print(f'[serve] STALL attempt {attempt}: cleared control file, fresh start next',flush=True)
                 else:
                     print(f'[serve] STALL attempt {attempt}: resuming in {delay}s',flush=True)
@@ -357,11 +416,11 @@ def dl(url,keep):
             except sp.CalledProcessError as e:
                 last_exc=e; rc=e.returncode
                 if DOWNLOADER=='hf' or attempt>=DOWNLOAD_MAX_ATTEMPTS:
-                    _try_remove(dest,f'{dest}.aria2'); break
+                    _cleanup(); break
                 if rc in _FATAL_ARIA2C_CODES:
                     # aria2c can't reach the file (404/auth/etc) — try hf CLI as fallback
                     print(f'[serve] aria2c fatal rc={rc} for {name}, trying hf fallback',flush=True)
-                    _try_remove(dest,f'{dest}.aria2')
+                    _cleanup()
                     try:
                         rem=url.removeprefix('https://huggingface.co/')
                         hf_parts=rem.split('/'); hf_repo='/'.join(hf_parts[:2]); hf_rev=hf_parts[3]; hf_fname='/'.join(hf_parts[4:])
@@ -387,10 +446,10 @@ def dl(url,keep):
                 time.sleep(delay); delay=min(delay*2,300)
 
             except Exception as e:
-                last_exc=e; _try_remove(dest,f'{dest}.aria2'); break  # unexpected — don't retry
+                last_exc=e; _cleanup(); break  # unexpected — don't retry
     finally:
         prog.stop('error' if last_exc is not None else 'done')
-        _reserved.pop(dest,None)
+        _reserved.pop(part,None)
 
     if last_exc is not None:
         print(f'[serve] ERROR downloading {name}: {last_exc}',flush=True)

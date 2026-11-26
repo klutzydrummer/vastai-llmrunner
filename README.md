@@ -98,6 +98,34 @@ while the **Settings** entries of the same name are written into `config.yaml`
 by **Save & Regenerate**. As with `DOWNLOADER`, the `/app/...` file wins over the
 env var when both are set.
 
+### Download integrity
+
+aria2c writes to `<file>.part` and the file is renamed into place only after
+aria2c exits cleanly and the size matches the server's (`X-Linked-Size` from
+HuggingFace, else the final `Content-Length`; an unknown size skips only the
+size check). A model is reused as cached only if it exists, has no `.aria2`
+control file and matches that size, so a truncated file from an interrupted run
+is deleted and fetched again. On startup, any model with an `.aria2` sibling is
+removed. A per-file lock (`<file>.lock`) makes a second `serve.py` wait for the
+first and then find the file cached. The editor refuses to unload models or
+save/regenerate the config (HTTP 409) while a download is running, since that
+would kill it.
+
+The aria2c transfer limits default to aria2's own values and can be tightened
+with env vars when a host's link stalls:
+
+| Setting | Default | Notes |
+| --- | --- | --- |
+| `DOWNLOAD_CONNECT_TIMEOUT` | `60` | `--connect-timeout`, seconds |
+| `DOWNLOAD_TIMEOUT` | `60` | `--timeout`, seconds |
+| `DOWNLOAD_LOWEST_SPEED` | `0` | `--lowest-speed-limit`, bytes/s; `0` is off |
+
+aria2c also runs with `--allow-overwrite=true --auto-file-renaming=false`
+(safe because the `.part` name is private; it still resumes from its control
+file). The `hf` downloader is unchanged; `huggingface_hub` honours
+`HF_HUB_DOWNLOAD_TIMEOUT` (default 10 s) itself. `HF_BACKEND=hf_transfer` is
+deprecated upstream in favour of `hf_xet`, the default.
+
 ## Context length
 
 The status bar in `/editor` leads with the loaded model's context per slot out

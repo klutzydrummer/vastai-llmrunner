@@ -179,7 +179,20 @@ def llama_swap(method,path,body=None):
         r=c.getresponse(); d=r.read(); c.close(); return r.status,d
     except Exception as e: return 0,str(e).encode()
 
+class DownloadInProgress(Exception): pass
+
+def downloading():
+    """True while serve.py is fetching a model. serve.py rewrites the status
+    file every couple of seconds during a download, so a stale file means the
+    process died and must not block the editor forever."""
+    try:
+        if time.time()-os.path.getmtime(STATUS)>60: return False
+        return json.loads(open(STATUS).read()).get('status') in ('downloading','retrying')
+    except: return False
+
 def unload_all():
+    if downloading():
+        raise DownloadInProgress('A model download is in progress; unloading now would interrupt it. Wait for it to finish.')
     s,_=llama_swap('POST','/api/models/unload')
     print(f'[cfgedit] unload: {s}',flush=True)
     try: os.remove(STATUS)
@@ -337,6 +350,10 @@ def _start_terminal_server():
             await asyncio.Future()
     asyncio.run(_serve())
 
+# POST/PUT paths that call unload_all()
+UNLOAD_PATHS=frozenset({'/config','/unload','/cache/purge','/cache_type','/ctx_overflow',
+                        '/slots','/load','/regen','/params','/params/reset'})
+
 class H(BaseHTTPRequestHandler):
     def log_message(self,fmt,*a): print(f'[cfgedit] {self.address_string()} {fmt%a}',flush=True)
     def ok(self,b,ct='text/plain'):
@@ -391,12 +408,24 @@ class H(BaseHTTPRequestHandler):
         elif self.path=='/processes':
             self.ok(subprocess.run(['ps','aux'],capture_output=True,text=True).stdout.encode())
         else: self.send_response(404);self.end_headers()
-    def do_PUT(self):
+    def _guarded(self,fn):
+        """Refuse anything that unloads models while a download runs (409)."""
+        try:
+            if self.path in UNLOAD_PATHS and downloading(): raise DownloadInProgress(
+                'A model download is in progress; unloading now would interrupt it. Wait for it to finish.')
+            fn()
+        except DownloadInProgress as e:
+            print(f'[cfgedit] refused {self.path}: {e}',flush=True)
+            b=str(e).encode()
+            self.send_response(409);self.send_header('Content-Length',len(b));self.end_headers();self.wfile.write(b)
+    def do_PUT(self): self._guarded(self._do_PUT)
+    def do_POST(self): self._guarded(self._do_POST)
+    def _do_PUT(self):
         if self.path=='/config':
             n=int(self.headers.get('Content-Length',0));d=self.rfile.read(n)
             unload_all();cfginit.write_config(d.decode(),CONFIG);self.ok(b'OK\n')
         else: self.send_response(404);self.end_headers()
-    def do_POST(self):
+    def _do_POST(self):
         n=int(self.headers.get('Content-Length',0));body=self.rfile.read(n)
         if self.path=='/config':
             cfg=urllib.parse.parse_qs(body.decode()).get('cfg',[''])[0]
