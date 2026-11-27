@@ -461,3 +461,4 @@ model.
 
 - [Dead-man guard](docs/deadman.md): auto-destroy a Vast instance at a deadline.
 - [Known issues](docs/known-issues.md): open problems, each labelled observed or hypothesis.
+- [Test fakes](tools/fakeserve/README.md): GPU-free fake llama-server and llama-swap for tests.
