@@ -13,7 +13,7 @@ Source: https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.ht
 ```
 tools/deadman/arm-deadman.sh <instance-id> "2026-11-26 19:30:00"   # UTC
 tools/deadman/arm-deadman.sh <instance-id> +85                     # minutes from now
-tools/deadman/disarm-deadman.sh <instance-id>
+tools/deadman/disarm-deadman.sh [--force] <instance-id>
 ```
 Arming writes `vast-deadman-<id>.{service,timer}` under `~/.config/systemd/user`
 (`Persistent=true`, `AccuracySec=1s`, `RemainAfterElapse=no`), enables the timer,
@@ -22,12 +22,25 @@ prints the `NEXT` line, and holds a sleep inhibitor
 `deadman.sh` tries `vastai destroy instance` up to `MAX_ATTEMPTS` (10) times,
 verifies with `vastai show instances --raw | jq`, logs to `LOG`, and sends
 `notify-send` and exits 1 on failure. Env: `VASTAI`, `LOG`, `RETRY_SLEEP`,
-`MAX_ATTEMPTS`, `UNIT_PREFIX`, `UNIT_DIR`. Disarm after a normal teardown.
+`MAX_ATTEMPTS`, `UNIT_PREFIX`, `UNIT_DIR`.
+
+## Teardown order
+Always in this exact order; never disarm first:
+1. `vastai destroy instance <id> -y`. The `-y` is required: without it the
+   command prompts for confirmation and aborts when run non-interactively. That
+   left the instance running with the dead-man already disarmed (an unguarded
+   window) in RUN-2.
+2. Verify the id is absent from `vastai show instances --raw`.
+3. Only then `tools/deadman/disarm-deadman.sh <id>`.
+
+`disarm-deadman.sh` enforces step 2: it exits 3 with a `REFUSING` message while
+the instance is still listed, or if the listing itself fails. `--force` skips the
+check (for cleanup of a dead-man whose instance is known to be gone).
 
 ## Tested vs not tested
 - TESTED (awake, fake `vastai`): `tools/deadman/test-dummy.sh` covers arm, timer
   listed, unit file persisted, inhibitor active, two failed destroys then a
-  verified one, disarm leaving nothing, and a never-succeeds case exiting 1.
+  verified one, disarm refused while listed and allowed after destroy, disarm leaving nothing, and a never-succeeds case exiting 1.
 - SIMULATED (no suspend/reboot): `tools/deadman/test-catchup.sh` stops the timer
   across the deadline then restarts it, re-execs the user manager, and restarts
   an enabled-but-stopped timer; all fire and verify. This shows the `Persistent=`
