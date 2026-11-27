@@ -39,6 +39,23 @@ class Validate(Base):
     def test_token_count_knob_allowed(self): self.assertEqual(self.errs(self.mut(lambda r:r['defaults'].update(image_min_tokens=1024))),[])
     def test_id_must_match_stem(self): self.assertTrue(self.errs(self.mut(lambda r:r['models'][A].update(url='https://x/other.gguf'))))
 
+MD={'kind':'omni-media','coexist':True,'ctx':8192,'weights_bytes':1846240736,'mmproj_bytes':506842432,'overhead_mb':1024}
+class Media(Base):
+    def mreg(self,**kw): return self.mut(lambda r:r['models'][B].update(media=dict(MD,**kw)))
+    def test_valid(self): self.assertEqual(self.errs(self.mreg()),[])
+    def test_bad_values(self):
+        for kw in ({'kind':'audio'},{'coexist':'yes'},{'ctx':0},{'weights_bytes':True},{'overhead_mb':-1},{'bogus':1}):
+            self.assertTrue(any('.media' in e for e in self.errs(self.mreg(**kw))),kw)
+    def test_missing(self):
+        for k in ('kind','coexist','ctx','weights_bytes'):
+            r=self.mreg(); del r['models'][B]['media'][k]
+            self.assertTrue(any(f'missing {k}' in e for e in self.errs(r)),k)
+        self.assertTrue(self.errs(self.mut(lambda r:r['models'][B].update(media=[1]))))
+    def test_row_carries_media(self):
+        self.write(self.mreg())
+        with mock.patch.dict(os.environ,{'MODELS':'both'}): rows=cfginit.load_registry()
+        self.assertNotIn('media',rows[0]); self.assertEqual(rows[1]['media'],MD)
+
 class Load(Base):
     def test_valid_load_and_good_copy(self):
         self.write(REG)
@@ -94,6 +111,13 @@ class Repo(unittest.TestCase):
         reg=json.load(open(os.path.join(ROOT,'models.json')))
         self.assertEqual(cfginit.validate_registry(reg,list(reg['models'])+list(reg['presets'])),[])
         for mid,m in reg['models'].items(): self.assertTrue(m.get('note'),mid)
+    def test_repo_media_entries(self):
+        reg=json.load(open(os.path.join(ROOT,'models.json')));M=reg['models']
+        co={k:v['media']['coexist'] for k,v in M.items() if 'media' in v}
+        self.assertEqual(co,{'Qwen3-Omni-30B-A3B-Instruct-Q8_0':False,'Qwen3-Omni-30B-A3B-Instruct-Q4_K_M':True,
+                             'LFM3-Omni-2B-Q8_0':True,'LFM3-Omni-2B-RP-Q8_0':True})   # F3=a: Q8 swaps; Q20a: Q4 sets
+        self.assertAlmostEqual(cfginit.need_mm_mb(M['Qwen3-Omni-30B-A3B-Instruct-Q4_K_M']['media']),21683,delta=1)
+        self.assertAlmostEqual(cfginit.need_mm_mb(M['LFM3-Omni-2B-Q8_0']['media']),3366,delta=1)
     def test_init_sh_fetches_models_json(self):
         src=open(os.path.join(ROOT,'init.sh')).read()
         self.assertTrue(re.search(r'for f in [^;]*\bmodels\.json\b[^;]*; do',src))

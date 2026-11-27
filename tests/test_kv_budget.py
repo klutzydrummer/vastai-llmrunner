@@ -7,7 +7,8 @@ ROOT=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC=open(os.path.join(ROOT,'serve.py')).read()
 NS={'math':math,'BATCH_CAP':4096}
 for n in ast.parse(SRC).body:
-    if isinstance(n,ast.FunctionDef) and n.name in ('kv_layout','kv_ctx_budget','batch_cap','draft_compute_bytes'): exec(compile(ast.Module([n],[]),'serve.py','exec'),NS)
+    if isinstance(n,ast.FunctionDef) and n.name in ('kv_layout','kv_ctx_budget','batch_cap','draft_compute_bytes','_co_reserve_mb','co_ctx_ok'): exec(compile(ast.Module([n],[]),'serve.py','exec'),NS)
+NS.update(os=os,CO_MIN_RP_CTX=16384)
 a=SRC.index("ub=int(os.environ.get('UBATCH_SIZE'");b=SRC.index('\n',SRC.index('ctx_budget=int(os.environ.get'))
 BLOCK=SRC[a:b]
 GIB=1<<30
@@ -29,6 +30,14 @@ def pantheon_ctx(vram_gib,**kw):
     rem=(vram_gib*1024*0.88-wm-pm-emb)*1048576
     compute=max(16*2048*2048*4,2*2112*2048*4)*3
     return NS['kv_ctx_budget'](rem-compute,lay(gemma4_meta()),1.0625,2240,30,30,8,176,**kw)
+
+def rp_ctx(vram_mb,reserve_mb,fixed_mb=13.3e9/1048576):
+    """T-F9 planner maths for an RP beside a media model: serve.py's rem with
+    CO_RESERVE_MB. MODELLED, not measured (V6 on hold): Gemma 4 12B RP taken as
+    13.3 GB fixed (spec-v2 2.3) and the Pantheon gemma4 layout as its KV stand-in."""
+    rem=(vram_mb*0.88-fixed_mb-reserve_mb)*1048576
+    compute=max(16*2048*2048*4,2*2112*2048*4)*3
+    return max(512,NS['kv_ctx_budget'](max(0,rem)-compute,lay(gemma4_meta()),1.0625,2240,30,30,8,176)//512*512)
 
 class T(unittest.TestCase):
     def test_batch_not_ctx(self):
@@ -83,5 +92,23 @@ class T(unittest.TestCase):
         self.assertEqual(ns['ctx_budget'],12345)
         with mock.patch.dict(os.environ,{'CTX_SIZE':'0'}): exec(BLOCK,ns)
         self.assertEqual(ns['ctx_budget']%512,0); self.assertGreater(ns['ctx_budget'],12345)
+
+class CoReserve(unittest.TestCase):
+    def test_env_parsing(self):
+        for raw,want in (('',0.0),('21683',21683.0),('-5',0.0),('junk',0.0)):
+            with mock.patch.dict(os.environ,{'CO_RESERVE_MB':raw}): self.assertEqual(NS['_co_reserve_mb'](),want,raw)
+    def test_reserve_in_rem(self):
+        self.assertIn("rem=(tv*0.88-wm-pm2-pdraft-pembed-pco)*1048576",SRC)
+        self.assertIn("if not co_ctx_ok(ctx_budget,pco):",SRC)
+    def test_ctx_floor(self):
+        ok=NS['co_ctx_ok']
+        self.assertTrue(ok(512,0))                      # no reserve: never refuse
+        self.assertTrue(ok(16384,21683)); self.assertFalse(ok(16383,21683))
+    def test_a6000_numbers(self):
+        # need_mm (cfginit.need_mm_mb) for Qwen Q4 = 21683 MiB, LFM3 = 3366 MiB
+        q4=rp_ctx(49140,21683); lfm=rp_ctx(49140,3366); solo=rp_ctx(49140,0)
+        self.assertTrue(NS['co_ctx_ok'](q4,21683)); self.assertGreater(lfm,q4); self.assertGreater(solo,lfm)
+        self.assertFalse(NS['co_ctx_ok'](rp_ctx(24576,21683),21683))   # 24 GB: Q4 cannot sit beside a 12B
+        print(f'\nmodelled 12B RP ctx on A6000: solo={solo} +LFM3={lfm} +Q4={q4}')
 
 if __name__=='__main__': unittest.main()

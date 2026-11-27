@@ -1,4 +1,4 @@
-import os, json, re
+import os, json, re, subprocess
 
 PARAMS_FILE = "/app/params.json"
 PASS_KEYS = ["HF_TOKEN","DOWNLOADER","HF_BACKEND","DOWNLOAD_CONNECTIONS",
@@ -71,6 +71,25 @@ def _check_knobs(where, d, allowed, errs):
         elif k in ("no_mtp", "mlock"):
             if not isinstance(v, bool): errs.append(f"{where}.{k}: must be true/false")
 
+# Omni media models (spec-v2 2.3, 3.3): sizes for the static need_mm, which
+# sizes the <rp>@co reserve and decides which (RP, media) pairs get a set.
+MEDIA_KINDS = ("omni-media",)
+MEDIA_INTS = {"ctx": 1, "weights_bytes": 1, "mmproj_bytes": 0, "overhead_mb": 0}  # key -> minimum
+
+def _check_media(where, md, errs):
+    if not isinstance(md, dict): errs.append(f"{where}: must be an object"); return
+    for k, v in md.items():
+        if k == "kind":
+            if v not in MEDIA_KINDS: errs.append(f"{where}.kind: must be one of {list(MEDIA_KINDS)}")
+        elif k == "coexist":
+            if not isinstance(v, bool): errs.append(f"{where}.coexist: must be true/false")
+        elif k in MEDIA_INTS:
+            if isinstance(v, bool) or not isinstance(v, int) or v < MEDIA_INTS[k]:
+                errs.append(f"{where}.{k}: must be an integer >= {MEDIA_INTS[k]}")
+        else: errs.append(f"{where}: unknown key {k!r}")
+    for k in ("kind", "coexist", "ctx", "weights_bytes"):
+        if k not in md: errs.append(f"{where}: missing {k}")
+
 def validate_registry(reg, selected=None):
     """Return a list of problems (empty = valid). `selected` is the MODELS list."""
     errs = []
@@ -92,7 +111,8 @@ def validate_registry(reg, selected=None):
         if "note" in m and not isinstance(m["note"], str): errs.append(f"{w}.note: must be a string")
         if "sha256" in m and not (isinstance(m["sha256"], str) and re.fullmatch(r"[0-9a-fA-F]{64}", m["sha256"])):
             errs.append(f"{w}.sha256: must be 64 hex characters")
-        _check_knobs(w, {k: v for k, v in m.items() if k not in ("note", "sha256", *URLS)}, knobs, errs)
+        if "media" in m: _check_media(f"{w}.media", m["media"], errs)
+        _check_knobs(w, {k: v for k, v in m.items() if k not in ("note", "sha256", "media", *URLS)}, knobs, errs)
     d = reg.get("defaults", {})
     if not isinstance(d, dict): errs.append("defaults: must be an object")
     else: _check_knobs("defaults", d, knobs | set(DEFAULT_ONLY), errs)
@@ -137,8 +157,10 @@ def _registry_rows(reg, selected):
         if env.get("NO_MTP") == "0": del env["NO_MTP"]
         # expected sha256 of `url` when it is not a HuggingFace URL (dlverify.py)
         if m.get("sha256"): env["MODEL_SHA256"] = m["sha256"].lower()
-        rows.append({"model_url": m["url"], "mmproj_url": m.get("mmproj", ""),
-                     "draft_model_url": m.get("draft", ""), "env": env, "note": m.get("note", "")})
+        row = {"model_url": m["url"], "mmproj_url": m.get("mmproj", ""),
+               "draft_model_url": m.get("draft", ""), "env": env, "note": m.get("note", "")}
+        if m.get("media"): row["media"] = m["media"]
+        rows.append(row)
     return rows
 
 def load_registry():
@@ -395,22 +417,63 @@ def model_stems(models):
         stems.append(cand)
     return stems
 
-def build_config(params):
+# ── coexist planning (static half of F2=c; the live free-VRAM check is RTR's) ─
+CO_MARGIN_MB = 1024   # 2.3 fit-target style margin
+CO_EVICT_COST = 20    # RP reloads are slow; prefer evicting the media model
+
+def gpu_total_mb():
+    """Total MiB over all GPUs: VRAM_MB (as serve.py reads it), else nvidia-smi.
+    None when unknown, which turns coexist sets off (everything swaps)."""
+    raw = os.environ.get("VRAM_MB", "").strip()
+    try:
+        if raw: return sum(int(float(x)) for x in raw.split(",") if x.strip()) or None
+        r = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=20)
+        return sum(int(x) for x in r.stdout.split() if x.strip()) or None
+    except Exception:
+        return None
+
+def need_mm_mb(md):
+    """2.3: mm_weights*1.05 + mm_mmproj*1.02 + kv/compute at its fixed ctx."""
+    mib = 1048576
+    return int(md["weights_bytes"] / mib * 1.05 + md.get("mmproj_bytes", 0) / mib * 1.02 + md.get("overhead_mb", 0) + 0.999)
+
+def co_media_fits(md, total_mb):
+    """Static media-side check of 2.3 on this GPU. The RP side (rp_ctx >= 16384
+    with the reserve) needs GGUF metadata, so serve.py checks it at load."""
+    return bool(md.get("coexist")) and bool(total_mb) and need_mm_mb(md) + CO_MARGIN_MB <= total_mb * 0.88
+
+def build_config(params, total_mb=None):
     lines = ["healthCheckTimeout: 3600", "sendLoadingState: true", "models:"]
     found = 0
     entries = [m for m in params.get("models", []) if (m.get("model_url") or "").strip()]
     stems = model_stems(entries)
     emitted = set()
+    media = [(m, MN) for m, MN in zip(entries, stems) if m.get("media")]
+    if any(md.get("coexist") for md in (m["media"] for m, _ in media)):
+        total_mb = total_mb if total_mb is not None else gpu_total_mb()
+    co = [(MN, need_mm_mb(m["media"])) for m, MN in media if co_media_fits(m["media"], total_mb)]
+    if media and not co:
+        print(f"[init] coexist: no media model fits beside an RP (GPU {total_mb or 'unknown'} MiB); all swap", flush=True)
+    co_vars, co_sets = {}, []   # var name -> model id; (set name, rp var, media vars)
+    mvars = {MN: f"mm{i}" for i, (MN, _n) in enumerate(co, 1)}
+    for MN, mv in mvars.items(): co_vars[mv] = MN
     for m, MN in zip(entries, stems):
         MU = (m.get("model_url") or "").strip()
         MMU = (m.get("mmproj_url") or "").strip()
         DMU = (m.get("draft_model_url") or "").strip()
         found += 1
         # variants: (suffix, include_mmproj, include_draft, no_mtp)
+        md = m.get("media")
         variants = [('', True, True, False)]        # default: mmproj + draft
-        if MMU:
+        if MMU and not md:
             variants.append(('-nomtp', True, False, True))   # mmproj, no draft, spec disabled
             variants.append(('-text', False, True, False))   # no mmproj, draft only
+        # Q18a: one <rp>@co sibling per RP, reserving the largest need_mm of the
+        # media it may run beside (all media that pass the static check here)
+        reserve = max((n for _mn, n in co), default=0) if not md else 0
+        if reserve:
+            variants.append(('@co', True, True, False))
         for sfxv, use_mm, use_dm, no_mtp in variants:
             # One entry per variant: serve.py picks the slot count itself
             # (PARALLEL=auto), and the editor's slot slider overrides it per model.
@@ -436,7 +499,8 @@ def build_config(params):
             lines.append(f'      - "DRAFT_MODEL_URL={DMU if use_dm else ""}"')
             if no_mtp:
                 lines.append(f'      - "NO_MTP=1"')
-            own = m.get("env") or {}
+            own = dict(m.get("env") or {})
+            if md: own["CTX_SIZE"] = str(md["ctx"])   # 3.3: media gets a fixed ctx, one slot
             for k, v in own.items():
                 if k != "NO_MTP" or not no_mtp:
                     lines.append(f'      - "{k}={v}"')
@@ -444,7 +508,11 @@ def build_config(params):
                 v = params.get("settings", {}).get(k)
                 if v and k not in own:
                     lines.append(f'      - "{k}={v}"')
-            lines.append(f'      - "PARALLEL=auto"')
+            if sfxv == '@co':
+                lines.append(f'      - "CO_RESERVE_MB={reserve}"')
+                rv = f"rp{len(co_sets) + 1}co"; co_vars[rv] = mid
+                co_sets.append((f"co{len(co_sets) + 1}", rv, list(mvars.values())))
+            lines.append(f'      - "PARALLEL={1 if md else "auto"}"')
             lines.append(f'      - "MODEL_ID={mid}"')
             lines.append(f"    cmd: python3 /tmp/serve.py ${{PORT}}")
             lines.append(f"    logFile: /tmp/serve-{mid}.log")
@@ -471,6 +539,16 @@ def build_config(params):
         lines.append(f"    checkEndpoint: /sdcpp/v1/capabilities")
         lines.append(f"    ttl: 0")
         lines.append(f"    logFile: /tmp/serve-{mid}.log")
+    if co_sets:
+        # llama-swap v277 matrix router (P0 primer). Model ids carry '_' and '@',
+        # which the set DSL may not accept, so sets use vars only (names [a-z0-9]).
+        # Models in no set (plain RPs, Qwen Q8, images) still run alone = swap.
+        lines += ["routing:", "  router:", "    use: matrix", "    settings:", "      matrix:", "        vars:"]
+        lines += [f"          {v}: {mid!r}" for v, mid in co_vars.items()]
+        lines.append("        evict_costs:")
+        lines += [f"          {rv}: {CO_EVICT_COST}" for _s, rv, _m in co_sets]
+        lines.append("        sets:")
+        lines += [f'          {s}: "{rv} & ({" | ".join(mv)})"' for s, rv, mv in co_sets]
     return "\n".join(lines) + "\n", found
 
 def write_config(cfg, path="/app/config.yaml"):

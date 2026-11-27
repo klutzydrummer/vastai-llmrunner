@@ -730,6 +730,18 @@ def _embed_reserve_mb():
     return 0.0
 pembed=_embed_reserve_mb()
 if pembed: print(f'[serve] reserving {pembed:.0f}MB VRAM for embeddings sidecar',flush=True)
+def _co_reserve_mb():
+    """VRAM left free for a media model that may run beside this one. cfginit
+    sets CO_RESERVE_MB on <rp>@co variants to the largest static need_mm of the
+    media allowed with that RP (spec-v2 2.3, Q18a). 0 = plan for the whole GPU."""
+    raw=os.environ.get('CO_RESERVE_MB','').strip()
+    try: return max(0.0,float(raw)) if raw else 0.0
+    except ValueError: print(f'[serve] warn: bad CO_RESERVE_MB={raw!r}, reserving nothing',flush=True); return 0.0
+pco=_co_reserve_mb()
+if pco: print(f'[serve] reserving {pco:.0f}MB VRAM for a coexisting media model',flush=True)
+# 2.3: a coexisting RP must keep at least this much context, else it should swap
+CO_MIN_RP_CTX=16384
+def co_ctx_ok(ctx_budget,reserve): return not reserve or ctx_budget>=CO_MIN_RP_CTX
 BATCH_CAP=4096
 def batch_cap(ctx,ub):
     """--batch-size: never above BATCH_CAP, never below ubatch, never above ctx.
@@ -741,7 +753,7 @@ def draft_compute_bytes(nh,ffn,ub,safety):
     graph at the same ubatch. Uses the target's nh/ffn as a conservative stand-in
     for the draft's (UNVERIFIED: not measured on a GPU, see docs/known-issues.md)."""
     return max(nh*ub*ub*4,2*ffn*ub*4)*safety
-ndev=max(len(vrams),1);rem=(tv*0.88-wm-pm2-pdraft-pembed)*1048576
+ndev=max(len(vrams),1);rem=(tv*0.88-wm-pm2-pdraft-pembed-pco)*1048576
 SAFETY=3.0;cpd=max(0.0,rem)*cf/ndev
 if cpd>0:
     ub_attn=math.sqrt(cpd/(nh*4*SAFETY));ub_ffn=cpd/(2*ffn*4*SAFETY)
@@ -765,6 +777,10 @@ if mmp and os.path.isfile(mmp):
 swa_full=os.environ.get('SWA_FULL','0')=='1'
 kv_lay=kv_layout(meta,arch,nl,hd,nk)
 ctx_budget=int(os.environ.get('CTX_SIZE','0')) or max(512,(kv_ctx_budget(kv_bytes,kv_lay,eb,ub,nl,nkv,nk,hd,swa_full)//512)*512)
+if not co_ctx_ok(ctx_budget,pco):
+    # fail the load so the caller uses the plain variant (swap) instead
+    print(f'[serve] ERROR: CO_RESERVE_MB={pco:.0f} leaves ctx {ctx_budget} < {CO_MIN_RP_CTX}; '
+          'this pair cannot coexist on this GPU, use the variant without @co',flush=True); sys.exit(1)
 # ── context vs. trained context ───────────────────────────────────────────────
 # The KV budget above can hand a slot more context than the model was trained
 # for; llama-server then either refuses to load or generates gibberish past the
