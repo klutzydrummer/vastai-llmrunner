@@ -265,6 +265,15 @@ the base model — `--model <base>` plus `--spec-draft-model <mtp-assistant>`.
 Putting the same file in both the **Model URL** and **Draft/MTP URL** fields
 logs a warning.
 
+## llama-swap version
+
+`init.sh` installs a pinned llama-swap release, `LLAMA_SWAP_TAG` (default
+`v277`), because the generated config depends on llama-swap's routing keys.
+Set `LLAMA_SWAP_TAG=vNNN` in the container env to use another release, or
+`LLAMA_SWAP_TAG=latest` to take the newest one at boot. The installed version
+is logged at boot (`llama-swap version: ...`). A binary already on `PATH` is
+kept as is.
+
 ## Where the model list comes from
 
 The editor header says which source is in effect — `models from: saved params

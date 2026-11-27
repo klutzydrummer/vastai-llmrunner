@@ -13,6 +13,11 @@ case "$(uname -m)" in
     *) die "unsupported CPU architecture: $(uname -m)" ;;
 esac
 
+# llama-swap is pinned: cfginit's config relies on its routing keys, which
+# change between releases. Newest release when pinned (2026-11-27). Override
+# with LLAMA_SWAP_TAG=vNNN, or LLAMA_SWAP_TAG=latest to resolve at boot.
+LLAMA_SWAP_TAG="${LLAMA_SWAP_TAG:-v277}"
+
 # retry MAX INITIAL_DELAY_SECS CMD [ARGS...]  — exponential backoff wrapper
 retry(){
     local max="$1" delay="$2"; shift 2
@@ -124,18 +129,20 @@ runs(){
     (( rc != 126 && rc != 127 ))
 }
 
-# download_bin NAME REPO TAG_TO_VER_SED ASSET_TPL IS_TAR
+# download_bin NAME REPO TAG_TO_VER_SED ASSET_TPL IS_TAR [TAG]
 #   NAME         binary name in PATH
 #   REPO         e.g. mostlygeek/llama-swap
 #   TAG_TO_VER   sed expression to strip prefix (e.g. 's/^v//')
 #   ASSET_TPL    asset filename template; TAG, VER and ARCH are substituted
 #   IS_TAR       true|false
+#   TAG          exact release tag; empty or "latest" resolves the newest
 download_bin(){
     local name="$1"
     local repo="$2"
     local tag_strip="$3"
     local asset_tpl="$4"
     local is_tar="${5:-true}"
+    local pin="${6:-}"
 
     if command -v "$name" >/dev/null 2>&1; then
         if runs "$name"; then
@@ -146,10 +153,15 @@ download_bin(){
         rm -f "$(command -v "$name")"
     fi
 
-    LOG "resolving latest release for $repo"
     local tag ver asset url tmp archive
-    tag=$(retry 3 5 get_latest_tag "$repo") \
-        || die "could not resolve latest tag for $repo after retries"
+    if [ -n "$pin" ] && [ "$pin" != latest ]; then
+        tag="$pin"
+        LOG "using pinned release $tag for $repo"
+    else
+        LOG "resolving latest release for $repo"
+        tag=$(retry 3 5 get_latest_tag "$repo") \
+            || die "could not resolve latest tag for $repo after retries"
+    fi
     ver=$(echo "$tag" | sed "$tag_strip")
     asset=$(echo "$asset_tpl" | sed "s/TAG/$tag/g; s/VER/$ver/g; s/ARCH/$ARCH/g")
     url="https://github.com/${repo}/releases/download/${tag}/${asset}"
@@ -403,7 +415,14 @@ main(){
         mostlygeek/llama-swap \
         's/^v//' \
         'llama-swap_VER_linux_ARCH.tar.gz' \
-        true
+        true \
+        "$LLAMA_SWAP_TAG"
+    local swver
+    if swver=$(timeout 10 llama-swap --version 2>&1 | head -1) && [ -n "$swver" ]; then
+        LOG "llama-swap $swver (pin $LLAMA_SWAP_TAG)"
+    else
+        ERR "warn: llama-swap --version failed or printed nothing (pin $LLAMA_SWAP_TAG), continuing"
+    fi
 
     # caddy: tag=v2.11.2 → ver=2.11.2 → caddy_2.11.2_linux_ARCH.tar.gz
     download_bin caddy \
