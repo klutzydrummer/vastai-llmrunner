@@ -144,6 +144,12 @@ trusting it. An unverified file keeps its marker, so every boot asks the Hub
 again (hashing the file once it answers) and repeats the UNVERIFIED warning
 until the check passes.
 
+Boot cost: hashing reads the whole file once, so a fresh download takes longer
+to become ready by one full read of each file (for a 32 GB model that read is
+not small; the actual time has not been measured). A cached, verified file
+costs nothing on later boots. An unverified file costs one Hub request per
+boot, plus a full hash on the boot where the Hub first answers.
+
 The aria2c transfer limits default to aria2's own values and can be tightened
 with env vars when a host's link stalls:
 
@@ -307,6 +313,11 @@ at most `SWAP_HOLD_S` seconds (default `600`). After that the request gets
 `503` with `{"error":{"message":"media swap in progress",...}}` and a
 `Retry-After` header. If RTR is down, guard does not hold anything. RTR logs
 to `/tmp/rtr.log`; a failure to start is logged but does not stop the boot.
+
+After a swap the role-play model starts with an empty cache, so its next reply
+re-reads the whole chat. RTR has been tested only against the fake llama-swap
+in `tests/`; see [docs/known-issues.md](docs/known-issues.md) for this and the
+other open limits.
 
 | Env | Default | Meaning |
 | --- | --- | --- |
