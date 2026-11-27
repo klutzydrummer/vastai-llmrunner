@@ -32,8 +32,11 @@ verifies with `vastai show instances --raw | jq`, logs to `LOG`, and sends
   across the deadline then restarts it, re-execs the user manager, and restarts
   an enabled-but-stopped timer; all fire and verify. This shows the `Persistent=`
   logic, not a real suspend or reboot.
-- NOT tested on the host: real suspend/resume and reboot catch-up (UNRUN, see
-  `docs/deadman-host-tests.md` for the commands you run).
+- UNTESTED BY USER CHOICE: real suspend/resume and reboot catch-up on the host.
+  The user decided to skip both host tests; they were not merely left unrun.
+  `docs/deadman-host-tests.md` still lists the commands if that changes.
+- Operating rule: during a rental, do NOT suspend or reboot the host. Keep the
+  sleep inhibitor running (it does not stop a lid close, see Limits below).
 - Limits (official docs, 2026-11-26): `WakeSystem=` needs the system manager, so a
   user timer cannot wake a suspended host. The sleep inhibitor does not stop a
   lid close (`LidSwitchIgnoreInhibited=yes` by default); it does cover the suspend
