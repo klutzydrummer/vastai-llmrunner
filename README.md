@@ -108,8 +108,8 @@ control file and matches that size, so a truncated file from an interrupted run
 is deleted and fetched again. On startup, any model with an `.aria2` sibling is
 removed. A per-file lock (`<file>.lock`) makes a second `serve.py` wait for the
 first and then find the file cached. The editor refuses to unload models or
-save/regenerate the config (HTTP 409) while a download is running, since that
-would kill it.
+save/regenerate the config (HTTP 409) while a download or its sha256 check is
+running, since that would kill it.
 
 ### sha256 verification
 
@@ -135,10 +135,13 @@ without a `sha256` field, a file the Hub lists without a sha256 (a small
 non-LFS file), or a failed Hub lookup with no cached hash. The file is used
 anyway, the log prints `WARNING: <file> is UNVERIFIED: <reason>`, and the
 status file carries `"unverified": [<files>]`, which the editor shows as
-"⚠ UNVERIFIED" next to the status. A file is hashed once, right after its
-download; a cached file is not re-hashed on later boots. A `<file>.verify`
-marker exists from the start of a download until its check finishes, so a run
-killed mid-check checks the file again next time instead of trusting it.
+"⚠ UNVERIFIED" next to the status. A verified file is hashed once, right
+after its download; a cached verified file is not re-hashed on later boots. A
+`<file>.verify` marker exists from the start of a download until its check
+passes, so a run killed mid-check checks the file again next time instead of
+trusting it. An unverified file keeps its marker, so every boot asks the Hub
+again (hashing the file once it answers) and repeats the UNVERIFIED warning
+until the check passes.
 
 The aria2c transfer limits default to aria2's own values and can be tightened
 with env vars when a host's link stalls:

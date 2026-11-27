@@ -48,14 +48,14 @@
     "LFM3-Omni-2B-Q8_0": {
       "url": "https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF/resolve/main/LFM3-Omni-2B-Q8_0.gguf",
       "mmproj": "https://huggingface.co/LiquidAI/LFM3-Omni-2B-GGUF/resolve/main/mmproj-LFM3-Omni-2B-Q8_0.gguf",
-      "media": {"kind": "omni-media", "coexist": true, "ctx": 8192, "weights_bytes": 1846240736, "mmproj_bytes": 506842432, "overhead_mb": 1024},
-      "note": "2026-11-27. LFM3-Omni base (LFM Open License v1.0), needs llama.cpp b11960+. File sizes from local copies; about 2.6 GB used on an RX 480 at ctx 4096, so overhead_mb 1024 at ctx 8192 is an estimate."
+      "media": {"kind": "omni-media", "coexist": true, "ctx": 8192, "weights_bytes": 1846240768, "mmproj_bytes": 506842528, "overhead_mb": 1024},
+      "note": "2026-11-27. LFM3-Omni base (LFM Open License v1.0), needs llama.cpp b11960+. File sizes from the HF paths-info API (checked 2026-11-27); about 2.6 GB used on an RX 480 at ctx 4096, so overhead_mb 1024 at ctx 8192 is an estimate."
     },
     "LFM3-Omni-2B-RP-Q8_0": {
       "url": "https://huggingface.co/ragraph-ai/LFM3-Omni-2B-RP/resolve/main/LFM3-Omni-2B-RP-Q8_0.gguf",
       "mmproj": "https://huggingface.co/ragraph-ai/LFM3-Omni-2B-RP/resolve/main/mmproj-LFM3-Omni-2B-Q8_0.gguf",
-      "media": {"kind": "omni-media", "coexist": true, "ctx": 8192, "weights_bytes": 1846240736, "mmproj_bytes": 506842432, "overhead_mb": 1024},
-      "note": "2026-11-27. ragraph-ai roleplay finetune of LFM3-Omni-2B with the repo's own mmproj (its sha256 differs from the base one). Sizes as the base Q8_0; overhead_mb is an estimate."
+      "media": {"kind": "omni-media", "coexist": true, "ctx": 8192, "weights_bytes": 1846240096, "mmproj_bytes": 506842528, "overhead_mb": 1024},
+      "note": "2026-11-27. ragraph-ai roleplay finetune of LFM3-Omni-2B with the repo's own copy of the mmproj (same sha256 as the base mmproj, checked 2026-11-27). Sizes from the HF paths-info API; overhead_mb is an estimate."
     }
   },
   "images": {

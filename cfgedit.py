@@ -182,12 +182,13 @@ def llama_swap(method,path,body=None):
 class DownloadInProgress(Exception): pass
 
 def downloading():
-    """True while serve.py is fetching a model. serve.py rewrites the status
-    file every couple of seconds during a download, so a stale file means the
-    process died and must not block the editor forever."""
+    """True while serve.py is fetching or hash-checking a model. serve.py
+    rewrites the status file every couple of seconds during a download or
+    check, so a stale file means the process died and must not block the
+    editor forever."""
     try:
         if time.time()-os.path.getmtime(STATUS)>60: return False
-        return json.loads(open(STATUS).read()).get('status') in ('downloading','retrying')
+        return json.loads(open(STATUS).read()).get('status') in ('downloading','retrying','verifying')
     except: return False
 
 def unload_all():

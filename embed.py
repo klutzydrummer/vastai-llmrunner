@@ -123,7 +123,8 @@ def progress_reporter(dest,size,base):
 def download(url):
     """Fetch the embedding model, then check its sha256 (dlverify.py). A
     `<file>.verify` marker exists from the start of a download until the check
-    finishes, so a run killed mid-check re-checks the cached file."""
+    passes, so a run killed mid-check re-checks the cached file; an unverified
+    file keeps it, so each boot retries the lookup and warns again."""
     dest=model_path(url); name=url.split('/')[-1]; mark=dest+'.verify'
     if not os.path.isfile(dest): open(mark,'a').close()
     _fetch(url)
@@ -142,9 +143,12 @@ def download(url):
         try:
             result=dlverify.verify(dest,url,MODEL_DIR,redownload,token=os.environ.get('HF_TOKEN',''),
                                    status=status,log=lambda m:log(m.replace('[verify] ','',1)))
-        finally:
-            _try_remove(mark)
-    if result=='unverified' and name not in UNVERIFIED: UNVERIFIED.append(name)
+        except BaseException:
+            _try_remove(mark); raise
+    # an unverified file keeps its marker: the next boot retries the lookup
+    if result=='unverified':
+        if name not in UNVERIFIED: UNVERIFIED.append(name)
+    else: _try_remove(mark)
     return dest
 
 def _fetch(url):

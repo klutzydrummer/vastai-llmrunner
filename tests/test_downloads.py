@@ -231,6 +231,30 @@ class Verify(unittest.TestCase):
         self.ns['write_status']({'status':'loading'})  # the warning outlives the download bars
         self.assertIn('m.gguf',self.status_doc()['unverified'])
 
+    def test_unverified_file_is_retried_each_boot_until_verified(self):
+        with self.hub({'m.gguf':OSError('no route')}): out=self.dl(HF+'m.gguf',[self.GOOD])
+        self.assertTrue(os.path.exists(out+'.verify'))  # kept for the next boot
+        hub=FakeHub({'m.gguf':OSError('still down')})
+        with mock.patch.object(dlverify,'hf_sha256',hub), mock.patch('builtins.print') as pr:
+            self.dl(HF+'m.gguf',[self.BAD])
+        self.assertEqual(len(hub.asked),1); self.assertEqual(len(self.calls),1)  # asked again, not re-fetched
+        self.assertTrue(any('UNVERIFIED' in str(c) for c in pr.call_args_list))
+        self.assertTrue(os.path.exists(out+'.verify'))
+        self.assertEqual(self.status_doc()['verify'],'unverified')
+        hub=FakeHub({'m.gguf':sha(self.GOOD)})  # the Hub answers: hashed, marker gone
+        with mock.patch.object(dlverify,'hf_sha256',hub): self.dl(HF+'m.gguf',[self.BAD])
+        self.assertEqual(len(hub.asked),1); self.assertEqual(len(self.calls),1)
+        self.assertEqual(self.status_doc()['verify'],'verified')
+        self.assertFalse(os.path.exists(out+'.verify'))
+        with mock.patch.object(dlverify,'hf_sha256',hub): self.dl(HF+'m.gguf',[self.BAD])
+        self.assertEqual(len(hub.asked),1)  # verified now: no further lookups
+
+    def test_unverified_retry_catches_a_bad_file_later(self):
+        with self.hub({'m.gguf':OSError('no route')}): out=self.dl(HF+'m.gguf',[self.BAD])
+        with self.hub({'m.gguf':sha(self.GOOD)}): self.dl(HF+'m.gguf',[self.GOOD])
+        self.assertEqual(open(out,'rb').read(),self.GOOD); self.assertEqual(len(self.calls),2)
+        self.assertFalse(os.path.exists(out+'.verify'))
+
     def test_non_lfs_file_loads_unverified(self):
         with self.hub({'m.gguf':None}): self.dl(HF+'m.gguf',[self.GOOD])
         self.assertEqual(self.status_doc()['verify'],'unverified')
@@ -346,6 +370,14 @@ class EmbedVerify(unittest.TestCase):
         self.m.write_status({'status':'ready'})
         self.assertEqual(json.load(open(self.m.STATUS))['unverified'],['e.gguf'])
 
+    def test_embed_unverified_is_retried_next_boot(self):
+        with self.hub(OSError('down')), self.fake_run([self.GOOD]): p=self.m.download(HF+'e.gguf')
+        self.assertTrue(os.path.exists(p+'.verify'))
+        hub=FakeHub({'e.gguf':sha(self.GOOD)})
+        with mock.patch.object(dlverify,'hf_sha256',hub), self.fake_run([self.BAD]): self.m.download(HF+'e.gguf')
+        self.assertEqual(len(hub.asked),1); self.assertEqual(self.runs,1)
+        self.assertFalse(os.path.exists(p+'.verify'))
+
 class CfgeditGuard(unittest.TestCase):
     def setUp(self):
         self.d=tempfile.mkdtemp()
@@ -362,7 +394,7 @@ class CfgeditGuard(unittest.TestCase):
         t=time.time()-age; os.utime(self.m.STATUS,(t,t))
 
     def test_blocks_while_downloading(self):
-        for st in ('downloading','retrying'):
+        for st in ('downloading','retrying','verifying'):
             self.status(st)
             with mock.patch.object(self.m,'llama_swap') as ls, self.assertRaises(self.m.DownloadInProgress):
                 self.m.unload_all()
@@ -383,5 +415,14 @@ class CfgeditGuard(unittest.TestCase):
         h._guarded(lambda:called.append(1))
         self.assertEqual(sent,[409]); self.assertEqual(called,[])
         self.assertIn(b'download',h.wfile.write.call_args[0][0])
+
+    def test_http_returns_409_while_verifying(self):
+        self.status('verifying')
+        for path in sorted(self.m.UNLOAD_PATHS):
+            h=self.m.H.__new__(self.m.H); h.path=path
+            sent=[]; h.send_response=lambda c:sent.append(c); h.send_header=lambda *a:None; h.end_headers=lambda:None
+            h.wfile=mock.Mock(); called=[]
+            h._guarded(lambda:called.append(1))
+            self.assertEqual((sent,called),([409],[]),path)
 
 if __name__=='__main__': unittest.main()

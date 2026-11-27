@@ -278,8 +278,9 @@ except ImportError: dlverify=None
 MODEL_SHA256=os.environ.get('MODEL_SHA256','').strip()  # models.json `sha256`, non-HF MODEL_URL only
 
 def _verify_mark(dest):
-    """Exists from the start of a download until its hash check finishes, so a
-    run killed mid-check re-checks the file instead of trusting it as cached."""
+    """Exists from the start of a download until its hash check passes, so a
+    run killed mid-check re-checks the file instead of trusting it as cached.
+    An unverified file keeps it: each boot retries the lookup and warns."""
     return dest+'.verify'
 
 def _dl_locked(url,keep,name,dest):
@@ -308,7 +309,9 @@ def _dl_locked(url,keep,name,dest):
             set_progress(name,status='error',error=str(e))
             write_status({'status':'error','model':name,'error':str(e),'ts':int(time.time())})
             raise
-    _try_remove(mark)
+    # an unverified file keeps its marker, so every boot asks the Hub again
+    # (and hashes once it answers) and repeats the UNVERIFIED warning
+    if result!='unverified': _try_remove(mark)
     sz_mb=os.path.getsize(dest)//1048576
     if result=='unverified':
         with _status_lock:

@@ -10,7 +10,8 @@ sha256:
     `override`.
 With no expected hash (non-HF without `sha256`, an HF file the Hub has no
 sha256 for, e.g. a non-LFS file, or a failed lookup with nothing cached) the
-file is used anyway with a loud UNVERIFIED warning.
+file is used anyway with a loud UNVERIFIED warning. Callers keep the file's
+`.verify` marker then, so each boot retries the lookup and warns again.
 
 A mismatch deletes the file and downloads it once more; a second mismatch is
 an error naming the file and both hashes.

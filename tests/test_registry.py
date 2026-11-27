@@ -39,7 +39,7 @@ class Validate(Base):
     def test_token_count_knob_allowed(self): self.assertEqual(self.errs(self.mut(lambda r:r['defaults'].update(image_min_tokens=1024))),[])
     def test_id_must_match_stem(self): self.assertTrue(self.errs(self.mut(lambda r:r['models'][A].update(url='https://x/other.gguf'))))
 
-MD={'kind':'omni-media','coexist':True,'ctx':8192,'weights_bytes':1846240736,'mmproj_bytes':506842432,'overhead_mb':1024}
+MD={'kind':'omni-media','coexist':True,'ctx':8192,'weights_bytes':1846240768,'mmproj_bytes':506842528,'overhead_mb':1024}
 class Media(Base):
     def mreg(self,**kw): return self.mut(lambda r:r['models'][B].update(media=dict(MD,**kw)))
     def test_valid(self): self.assertEqual(self.errs(self.mreg()),[])
