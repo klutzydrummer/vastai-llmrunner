@@ -4,6 +4,8 @@ temp dir. No network: a local http.server and a fake aria2c stand in."""
 import fcntl,http.server,importlib.util,json,os,sys,tempfile,threading,time,types,unittest
 from unittest import mock
 ROOT=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0,ROOT)  # serve.py and embed.py import dlverify from their own dir
+import dlverify
 
 def load_serve(model_dir,env=None):
     src=open(os.path.join(ROOT,'serve.py')).read()
@@ -145,6 +147,204 @@ class T(unittest.TestCase):
         ns=load_serve(self.d,{'DOWNLOAD_CONNECTIONS':'4'})
         self.assertEqual(ns['DOWNLOAD_CONNECTIONS'],4)
         self.assertEqual(ns['_int_setting']('X',7,1,9),7)
+
+# ------------------------------------------------------------------ T-F11
+# sha256 verification of every download. The Hub lookup is replaced by a fake
+# hash source and aria2c by a fake that writes the next payload in a list, so
+# nothing touches the network.
+import hashlib
+def sha(b): return hashlib.sha256(b).hexdigest()
+HF='https://huggingface.co/o/r/resolve/main/'
+
+def fake_aria2_seq(ns,payloads,calls):
+    """Like fake_aria2, but each run writes the next payload in `payloads`."""
+    class P:
+        def __init__(s,cmd,**k):
+            o=cmd[cmd.index('-o')+1]; d=cmd[cmd.index('-d')+1]
+            calls.append(cmd[-1] if not cmd[-1].startswith('--header') else cmd[-2])
+            open(os.path.join(d,o),'wb').write(payloads[min(len(calls),len(payloads))-1])
+            s.returncode=0
+        def poll(s): return s.returncode
+        def wait(s): return s.returncode
+        def kill(s): pass
+    return mock.patch.object(ns['sp'],'Popen',P)
+
+class FakeHub:
+    """Fake hash source: {file: sha256 | None (non-LFS) | Exception}."""
+    def __init__(self,table): self.table=table; self.asked=[]
+    def __call__(self,repo,rev,fname,token=''):
+        self.asked.append((repo,rev,fname)); v=self.table[fname]
+        if isinstance(v,Exception): raise v
+        return v
+
+class Verify(unittest.TestCase):
+    GOOD=b'g'*100; BAD=b'b'*100
+    def setUp(self):
+        self.d=tempfile.mkdtemp()
+        self.ns=load_serve(self.d,{'MODEL_URL':HF+'m.gguf'})
+        self.ns['DOWNLOAD_MAX_ATTEMPTS']=1
+        self.ns['remote_size']=lambda u:100   # no HEAD to huggingface.co
+        self.statuses=[]; orig=self.ns['write_status']
+        self.ns['write_status']=lambda d:(self.statuses.append(d.get('status')),orig(d))
+        self.calls=[]
+    def hub(self,table): return mock.patch.object(dlverify,'hf_sha256',FakeHub(table))
+    def dl(self,url,payloads):
+        with fake_aria2_seq(self.ns,payloads,self.calls): return self.ns['dl'](url,set())
+    def status_doc(self): return json.load(open(os.path.join(self.d,'st.json')))
+
+    def test_match_is_kept_and_cached(self):
+        with self.hub({'m.gguf':sha(self.GOOD)}): out=self.dl(HF+'m.gguf',[self.GOOD])
+        self.assertEqual(open(out,'rb').read(),self.GOOD); self.assertEqual(len(self.calls),1)
+        self.assertIn('verifying',self.statuses)
+        self.assertEqual(self.status_doc()['verify'],'verified')
+        self.assertFalse(os.path.exists(out+'.verify'))
+        self.assertEqual(dlverify.cache_get(self.d,'o/r@main:m.gguf'),sha(self.GOOD))
+
+    def test_mismatch_then_retry_ok(self):
+        with self.hub({'m.gguf':sha(self.GOOD)}): out=self.dl(HF+'m.gguf',[self.BAD,self.GOOD])
+        self.assertEqual(open(out,'rb').read(),self.GOOD); self.assertEqual(len(self.calls),2)
+        self.assertEqual(self.status_doc()['verify'],'verified')
+
+    def test_mismatch_twice_is_an_error_naming_file_and_hashes(self):
+        dest=self.d
+        with self.hub({'m.gguf':sha(self.GOOD)}), self.assertRaises(dlverify.HashMismatch) as cm:
+            self.dl(HF+'m.gguf',[self.BAD,self.BAD,self.GOOD])
+        msg=str(cm.exception)
+        for part in ('m.gguf',sha(self.BAD),sha(self.GOOD)): self.assertIn(part,msg)
+        self.assertEqual(len(self.calls),2)  # exactly one re-download
+        self.assertEqual([f for f in os.listdir(dest) if f.endswith('m.gguf')],[])
+        self.assertFalse(any(f.endswith('.verify') for f in os.listdir(dest)))
+        st=self.status_doc(); self.assertEqual(st['status'],'error'); self.assertIn(sha(self.BAD),st['error'])
+
+    def test_lookup_failure_uses_cached_hash(self):
+        dlverify.cache_put(self.d,'o/r@main:m.gguf',sha(self.GOOD))
+        with self.hub({'m.gguf':OSError('no route')}): self.dl(HF+'m.gguf',[self.BAD,self.GOOD])
+        self.assertEqual(len(self.calls),2)  # the cached hash caught the bad first copy
+        self.assertEqual(self.status_doc()['verify'],'verified')
+
+    def test_lookup_failure_without_cache_loads_unverified(self):
+        with self.hub({'m.gguf':OSError('no route')}), mock.patch('builtins.print') as pr:
+            out=self.dl(HF+'m.gguf',[self.BAD])
+        self.assertEqual(open(out,'rb').read(),self.BAD)
+        self.assertTrue(any('UNVERIFIED' in str(c) for c in pr.call_args_list))
+        st=self.status_doc(); self.assertEqual(st['verify'],'unverified'); self.assertIn('m.gguf',st['unverified'])
+        self.ns['write_status']({'status':'loading'})  # the warning outlives the download bars
+        self.assertIn('m.gguf',self.status_doc()['unverified'])
+
+    def test_non_lfs_file_loads_unverified(self):
+        with self.hub({'m.gguf':None}): self.dl(HF+'m.gguf',[self.GOOD])
+        self.assertEqual(self.status_doc()['verify'],'unverified')
+
+    def test_rp_mmproj_and_draft_are_all_checked(self):
+        urls=[HF+'m.gguf',HF+'mmproj.gguf',HF+'MTP/mtp.gguf']
+        hub=FakeHub({'m.gguf':sha(self.GOOD),'mmproj.gguf':sha(self.GOOD),'MTP/mtp.gguf':sha(self.GOOD)})
+        with mock.patch.object(dlverify,'hf_sha256',hub), fake_aria2_seq(self.ns,[self.GOOD],self.calls):
+            self.ns['dl_all'](urls,set())
+        self.assertEqual(sorted(f for _,_,f in hub.asked),['MTP/mtp.gguf','m.gguf','mmproj.gguf'])
+        # a bad mmproj fails the whole set, same as a bad model file
+        hub=FakeHub({'m2.gguf':sha(self.GOOD),'mmproj2.gguf':sha(self.GOOD)})
+        with mock.patch.object(dlverify,'hf_sha256',hub), fake_aria2_seq(self.ns,[self.GOOD,self.BAD,self.BAD],[]), \
+             self.assertRaises(dlverify.HashMismatch) as cm:
+            self.ns['dl_all']([HF+'m2.gguf',HF+'mmproj2.gguf'],set())
+        self.assertIn('mmproj2.gguf',str(cm.exception))
+
+    def test_cached_file_is_not_rehashed_but_interrupted_check_is(self):
+        with self.hub({'m.gguf':sha(self.GOOD)}): out=self.dl(HF+'m.gguf',[self.GOOD])
+        hub=FakeHub({'m.gguf':sha(self.GOOD)})
+        with mock.patch.object(dlverify,'hf_sha256',hub): self.dl(HF+'m.gguf',[self.BAD])
+        self.assertEqual(hub.asked,[]); self.assertEqual(len(self.calls),1)
+        open(out+'.verify','w').close()  # killed during the hash check last time
+        with mock.patch.object(dlverify,'hf_sha256',hub): self.dl(HF+'m.gguf',[self.BAD])
+        self.assertEqual(len(hub.asked),1); self.assertEqual(len(self.calls),1)  # re-checked, not re-fetched
+        self.assertFalse(os.path.exists(out+'.verify'))
+
+    def test_non_hf_url_uses_models_json_sha256(self):
+        s=Srv(self.GOOD)
+        try:
+            for want,payloads,ok in ((sha(self.GOOD),[self.GOOD],True),(sha(self.GOOD),[self.BAD,self.BAD],False)):
+                ns=load_serve(tempfile.mkdtemp(),{'MODEL_URL':s.url,'MODEL_SHA256':want.upper()})
+                ns['DOWNLOAD_MAX_ATTEMPTS']=1
+                with fake_aria2_seq(ns,payloads,[]):
+                    if ok:
+                        ns['dl'](s.url,set())
+                        self.assertEqual(json.load(open(ns['STATUS']))['verify'],'verified')
+                    else:
+                        with self.assertRaises(dlverify.HashMismatch): ns['dl'](s.url,set())
+            ns=load_serve(tempfile.mkdtemp(),{'MODEL_URL':s.url})  # no sha256 field
+            with fake_aria2_seq(ns,[self.GOOD],[]): ns['dl'](s.url,set())
+            self.assertEqual(json.load(open(ns['STATUS']))['verify'],'unverified')
+        finally: s.close()
+
+class VerifyUnit(unittest.TestCase):
+    def test_hf_parts(self):
+        self.assertEqual(dlverify.hf_parts(HF+'MTP/a%20b.gguf'),('o/r','main','MTP/a b.gguf'))
+        self.assertIsNone(dlverify.hf_parts('https://example.com/o/r/resolve/main/x.gguf'))
+        self.assertIsNone(dlverify.hf_parts('https://huggingface.co/datasets/o/r/resolve/main/x'))
+
+    def test_hf_sha256_reads_lfs_oid_from_paths_info(self):
+        seen=[]
+        class R:
+            def __init__(s,body): s.body=body
+            def read(s): return s.body
+            def __enter__(s): return s
+            def __exit__(s,*a): pass
+        def fake_open(req,timeout=0):
+            seen.append(req)
+            return R(json.dumps([{'path':'a.gguf','oid':'1'*40,'lfs':{'oid':'A'*64,'size':1}},
+                                 {'path':'README.md','oid':'2'*40}]).encode())
+        with mock.patch.object(dlverify.urllib.request,'urlopen',fake_open):
+            self.assertEqual(dlverify.hf_sha256('o/r','main','a.gguf','tok'),'a'*64)
+            self.assertIsNone(dlverify.hf_sha256('o/r','main','README.md'))
+            with self.assertRaises(LookupError): dlverify.hf_sha256('o/r','main','gone.gguf')
+        r=seen[0]
+        self.assertEqual((r.get_method(),r.full_url),('POST','https://huggingface.co/api/models/o/r/paths-info/main'))
+        self.assertEqual(json.loads(r.data),{'paths':['a.gguf']}); self.assertEqual(r.get_header('Authorization'),'Bearer tok')
+
+    def test_registry_sha256_field(self):
+        spec=importlib.util.spec_from_file_location('cfginit',os.path.join(ROOT,'cfginit.py'))
+        ci=importlib.util.module_from_spec(spec); spec.loader.exec_module(ci)
+        reg={'models':{'m':{'url':'https://example.com/m.gguf','sha256':'AB'*32}}}
+        self.assertEqual(ci.validate_registry(reg,['m']),[])
+        self.assertEqual(ci._registry_rows(reg,['m'])[0]['env']['MODEL_SHA256'],'ab'*32)
+        self.assertIn('MODEL_SHA256='+'ab'*32,ci.build_config({'models':ci._registry_rows(reg,['m'])})[0])
+        reg['models']['m']['sha256']='xyz'
+        self.assertTrue(any('sha256' in e for e in ci.validate_registry(reg,['m'])))
+
+class EmbedVerify(unittest.TestCase):
+    """embed.py's download goes through the same check."""
+    GOOD=b'e'*50; BAD=b'f'*50
+    def setUp(self):
+        self.d=tempfile.mkdtemp()
+        spec=importlib.util.spec_from_file_location('embed_t',os.path.join(ROOT,'embed.py'))
+        self.m=importlib.util.module_from_spec(spec); spec.loader.exec_module(self.m)
+        self.m.MODEL_DIR=self.d; self.m.STATUS=os.path.join(self.d,'embed.json')
+        self.m.DOWNLOAD_MAX_ATTEMPTS=1
+        self.m.remote_size=lambda u,t:50
+        self.runs=0; self.statuses=[]
+        orig=self.m.write_status
+        self.m.write_status=lambda d:(self.statuses.append(d.get('status')),orig(d))
+    def fake_run(self,payloads):
+        def run(cmd,**k):
+            self.runs+=1
+            open(os.path.join(cmd[cmd.index('-d')+1],cmd[cmd.index('-o')+1]),'wb').write(payloads[min(self.runs,len(payloads))-1])
+            return types.SimpleNamespace(returncode=0,stdout='',stderr='')
+        return mock.patch.object(self.m.sp,'run',run)
+    def hub(self,v): return mock.patch.object(dlverify,'hf_sha256',FakeHub({'e.gguf':v}))
+
+    def test_embed_match_mismatch_retry_and_error(self):
+        with self.hub(sha(self.GOOD)), self.fake_run([self.GOOD]): p=self.m.download(HF+'e.gguf')
+        self.assertEqual(open(p,'rb').read(),self.GOOD); self.assertIn('verifying',self.statuses)
+        self.assertFalse(os.path.exists(p+'.verify')); os.remove(p); self.runs=0
+        with self.hub(sha(self.GOOD)), self.fake_run([self.BAD,self.GOOD]): self.m.download(HF+'e.gguf')
+        self.assertEqual(self.runs,2); os.remove(p); self.runs=0
+        with self.hub(sha(self.GOOD)), self.fake_run([self.BAD]), self.assertRaises(dlverify.HashMismatch) as cm:
+            self.m.download(HF+'e.gguf')
+        self.assertIn(sha(self.BAD),str(cm.exception)); self.assertFalse(os.path.exists(p)); self.assertFalse(os.path.exists(p+'.verify'))
+
+    def test_embed_unverified_flag_in_status(self):
+        with self.hub(OSError('down')), self.fake_run([self.GOOD]): self.m.download(HF+'e.gguf')
+        self.m.write_status({'status':'ready'})
+        self.assertEqual(json.load(open(self.m.STATUS))['unverified'],['e.gguf'])
 
 class CfgeditGuard(unittest.TestCase):
     def setUp(self):

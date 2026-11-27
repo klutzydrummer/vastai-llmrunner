@@ -34,7 +34,7 @@ EXPOSE_ACTIVE_ONLY_FILE='/app/expose_active_only'
 TRUTHY={'1','true','yes','on'}
 LLAMA_SWAP_HOST='localhost'; LLAMA_SWAP_PORT=8080
 SCRIPTS_BASE='https://raw.githubusercontent.com/klutzydrummer/vastai-llmrunner/'+(os.environ.get('REPO_REF') or 'main')
-SCRIPTS=['serve.py','cfgedit.py','guard.py','cfginit.py','embed.py','imgserve.py','init.sh','models.json']
+SCRIPTS=['serve.py','dlverify.py','cfgedit.py','guard.py','cfginit.py','embed.py','imgserve.py','init.sh','models.json']
 EMBED_STATUS='/tmp/embed_status.json'
 # Outcome of the last "Update Scripts" run, read back by the UI after the
 # editor re-execs so it can say which files actually changed.
@@ -969,9 +969,11 @@ function pollEmbed(){{
       txt='downloading '+s.model+' (attempt '+s.attempt+'/'+s.max_attempts+')';
       if(s.pct!=null)txt+=' — '+s.pct.toFixed(1)+'%';
     }}
+    else if(st==='verifying')txt='verifying sha256 '+s.model+(s.pct!=null?' — '+s.pct.toFixed(1)+'%':'');
     else if(st==='loading')txt='loading '+s.model;
     else if(st==='error')txt='error: '+s.error;
     txt+=age(s.ts);
+    if(s.unverified&&s.unverified.length)txt+=' — ⚠ UNVERIFIED (no sha256 to check)';
     el.style.background={{'error':'#fee','ready':'#dfd','downloading':'#e8f0fe','loading':'#e8f0fe'}}[st]||'#eee';
     el.textContent=txt;
     var w=document.getElementById('edl');
@@ -1021,6 +1023,7 @@ function dlLine(d){{
   var meta=[];
   if(d.status==='cached')meta.push('cached');
   else if(d.status==='error')meta.push('failed');
+  else if(d.status==='verifying')meta.push('verifying sha256');
   else if(d.status==='retrying')meta.push('retry '+(d.attempt||1)+'/'+(d.max_attempts||1)+(d.reason?' ('+d.reason+')':''));
   if(d.size_mb)meta.push((d.done_mb||0)+' / '+d.size_mb+' MB');
   else if(d.done_mb)meta.push(d.done_mb+' MB (size unknown)');
@@ -1032,7 +1035,7 @@ function dlLine(d){{
 }}
 function renderDownloads(s){{
   var w=document.getElementById('dlwrap'); if(!w)return;
-  var ds=(s&&s.downloads)||[],show=['downloading','retrying','downloaded','cached','error'].indexOf(s.status)>=0;
+  var ds=(s&&s.downloads)||[],show=['downloading','retrying','verifying','downloaded','cached','error'].indexOf(s.status)>=0;
   w.innerHTML=(ds.length&&show)?ds.map(dlLine).join(''):'';
 }}
 function age(ts){{if(!ts)return'';var d=Math.floor(Date.now()/1000-ts);if(d<5)return' (just now)';if(d<60)return' ('+d+'s ago)';if(d<3600)return' ('+Math.floor(d/60)+'m ago)';return' ('+Math.floor(d/3600)+'h ago)';}}
@@ -1044,8 +1047,10 @@ function poll(){{
     else if(st=='downloading')txt='downloading '+(s.pct!=null?s.pct+'% ':'')+s.model+(s.speed_mbps?' ('+s.speed_mbps.toFixed(1)+' MB/s)':'');
     else if(st=='loading')txt='loading '+(s.n_ctx_per_slot||s.ctx)+' ctx/slot × '+(s.par||1)+' — '+s.model;
     else if(st=='retrying')txt='retrying '+s.model+' (attempt '+s.attempt+'/'+s.max_attempts+', '+s.reason+')';
+    else if(st=='verifying')txt='verifying sha256 '+(s.pct!=null?s.pct+'% ':'')+s.model;
     else if(st=='error'){{txt='error: '+s.error;if(s.ts&&s.ts<lastSaveTs)txt+=' — stale (before last save)';}}
     txt+=age(s.ts);
+    if(s.unverified&&s.unverified.length)txt+=' — ⚠ UNVERIFIED (no sha256 to check): '+s.unverified.join(', ');
     el.style.background={{'error':'#fee','ready':'#dfd','downloading':'#e8f0fe','loading':'#e8f0fe','retrying':'#fff3cd'}}[st]||'#eee';
     el.textContent=txt;
     renderDownloads(s);

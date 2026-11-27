@@ -15,6 +15,11 @@ try:
     import cfginit
 except Exception:
     cfginit=None
+# sha256 check of the downloaded model (see dlverify.py); missing -> unverified
+try:
+    import dlverify
+except Exception:
+    dlverify=None
 
 MODEL_DIR='/models'
 STATUS='/tmp/embed_status.json'
@@ -38,7 +43,10 @@ def dl_connections():
     except ValueError: n=16
     return max(1,min(16,n))
 
+UNVERIFIED=[]  # set when the model was loaded without a hash check
+
 def write_status(d):
+    if UNVERIFIED: d={**d,'unverified':list(UNVERIFIED)}
     try: open(STATUS,'w').write(json.dumps(d))
     except Exception: pass
 
@@ -113,6 +121,33 @@ def progress_reporter(dest,size,base):
     return stop,t
 
 def download(url):
+    """Fetch the embedding model, then check its sha256 (dlverify.py). A
+    `<file>.verify` marker exists from the start of a download until the check
+    finishes, so a run killed mid-check re-checks the cached file."""
+    dest=model_path(url); name=url.split('/')[-1]; mark=dest+'.verify'
+    if not os.path.isfile(dest): open(mark,'a').close()
+    _fetch(url)
+    if not os.path.exists(mark): return dest
+    if dlverify is None:
+        log(f'WARNING: {name} is UNVERIFIED: dlverify.py is missing. Loading it anyway.')
+        result='unverified'
+    else:
+        def status(phase,done,size):
+            write_status({'status':phase,'model':name,'port':int(PORT),'done_mb':done//1048576,
+                          'size_mb':size//1048576,'pct':round(done*100.0/size,1) if size else None,
+                          'ts':int(time.time())})
+        def redownload():
+            open(mark,'a').close()
+            _fetch(url)
+        try:
+            result=dlverify.verify(dest,url,MODEL_DIR,redownload,token=os.environ.get('HF_TOKEN',''),
+                                   status=status,log=lambda m:log(m.replace('[verify] ','',1)))
+        finally:
+            _try_remove(mark)
+    if result=='unverified' and name not in UNVERIFIED: UNVERIFIED.append(name)
+    return dest
+
+def _fetch(url):
     """Fetch the embedding model, reusing the shared /models cache.
 
     Deliberately simpler than serve.py's downloader: embedding models are small

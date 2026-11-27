@@ -51,7 +51,7 @@ update_scripts(){
     # started just after a push can otherwise boot the previous copy. A unique
     # query string plus no-cache skips the edge cache.
     local cb; cb=$(date +%s%N)
-    for f in serve.py cfginit.py cfgedit.py guard.py embed.py imgserve.py models.json; do
+    for f in serve.py dlverify.py cfginit.py cfgedit.py guard.py embed.py imgserve.py models.json; do
         if curl -fsSL --max-time 30 -H 'Cache-Control: no-cache' "$base/$f?cb=$cb" -o "/tmp/$f"; then
             LOG "updated $f"
         else

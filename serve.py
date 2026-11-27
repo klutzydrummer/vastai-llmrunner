@@ -47,9 +47,11 @@ os.makedirs(MODEL_DIR,exist_ok=True)
 _status_lock=threading.RLock()
 _status_base={'status':'idle'}
 _dl_state={}
+_unverified=[]  # files loaded without a hash check; kept in every status write
 
 def _status_doc():
     d=dict(_status_base)
+    if _unverified: d['unverified']=list(_unverified)
     if _dl_state:
         dls=[dict(_dl_state[k]) for k in sorted(_dl_state)]
         d['downloads']=dls
@@ -268,7 +270,56 @@ def dl(url,keep):
             fcntl.flock(lk,fcntl.LOCK_EX)
         return _dl_locked(url,keep,name,dest)
 
+# ------------------------------------------------------- download verification
+# dlverify sits next to this script (init.sh fetches it into /tmp too). Without
+# it every download is used unverified, loudly, rather than stopping the box.
+try: import dlverify
+except ImportError: dlverify=None
+MODEL_SHA256=os.environ.get('MODEL_SHA256','').strip()  # models.json `sha256`, non-HF MODEL_URL only
+
+def _verify_mark(dest):
+    """Exists from the start of a download until its hash check finishes, so a
+    run killed mid-check re-checks the file instead of trusting it as cached."""
+    return dest+'.verify'
+
 def _dl_locked(url,keep,name,dest):
+    dest,fresh=_fetch(url,keep,name,dest)
+    mark=_verify_mark(dest)
+    if not fresh and not os.path.exists(mark): return dest
+    if dlverify is None:
+        print(f'[serve] WARNING: {name} is UNVERIFIED: dlverify.py is missing. Loading it anyway.',flush=True)
+        result='unverified'
+    else:
+        def status(phase,done,size):
+            pct=round(done*100.0/size,1) if size else None
+            set_progress(name,status=phase,pct=pct,done_mb=done//1048576,size_mb=size//1048576,speed_mbps=0,eta_s=None)
+            if done==0: write_status({'status':phase,'model':name,'ts':int(time.time())})
+        def redownload():
+            open(mark,'a').close()
+            _fetch(url,keep,name,dest)
+        try:
+            result=dlverify.verify(dest,url,MODEL_DIR,redownload,token=HF_TOKEN,
+                                   override=MODEL_SHA256 if url==MODEL_URL else '',status=status,
+                                   log=lambda m:print(m.replace('[verify]','[serve]',1),flush=True))
+        except Exception as e:
+            _try_remove(mark)
+            if not isinstance(e,dlverify.HashMismatch): raise
+            print(f'[serve] ERROR: {e}',flush=True)
+            set_progress(name,status='error',error=str(e))
+            write_status({'status':'error','model':name,'error':str(e),'ts':int(time.time())})
+            raise
+    _try_remove(mark)
+    sz_mb=os.path.getsize(dest)//1048576
+    if result=='unverified':
+        with _status_lock:
+            if name not in _unverified: _unverified.append(name)
+    set_progress(name,status='done',pct=100.0,done_mb=sz_mb,size_mb=sz_mb,verify=result)
+    write_status({'status':'downloaded','model':name,'size_mb':sz_mb,'verify':result,'ts':int(time.time())})
+    return dest
+
+def _fetch(url,keep,name,dest):
+    """Download `url` to `dest` unless a complete copy is cached. Returns
+    (dest, fresh) where fresh means a download actually ran."""
     part=dest+'.part'
     sz=remote_size(url)
     # cached only if complete: no control file, and the size matches when known
@@ -278,13 +329,14 @@ def _dl_locked(url,keep,name,dest):
         sz_mb=os.path.getsize(dest)//1048576
         set_progress(name,status='cached',pct=100.0,done_mb=sz_mb,size_mb=sz_mb)
         write_status({'status':'cached','model':name,'ts':int(time.time())})
-        return dest
+        return dest,False
     if os.path.exists(dest):
         print(f'[serve] {name} is incomplete or the wrong size, downloading again',flush=True)
     _try_remove(dest,f'{dest}.aria2')
     # a .part resumes only with its control file; without one aria2c would
     # write a renamed copy next to it
     if not os.path.exists(f'{part}.aria2'): _try_remove(part)
+    open(_verify_mark(dest),'a').close()
     sz_mb=sz//1048576 if sz else 0
     if sz:
         _reserved[part]=sz
@@ -459,7 +511,7 @@ def _dl_locked(url,keep,name,dest):
     print(f'[serve] downloaded: {name} ({final_mb}MB)',flush=True)
     set_progress(name,status='done',pct=100.0,done_mb=final_mb,size_mb=final_mb)
     write_status({'status':'downloaded','model':name,'size_mb':final_mb,'ts':int(time.time())})
-    return dest
+    return dest,True
 
 def dl_all(urls,keep):
     """Fetch every URL, up to DOWNLOAD_PARALLEL at a time. A model with an

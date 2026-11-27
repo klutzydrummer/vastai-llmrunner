@@ -111,6 +111,35 @@ first and then find the file cached. The editor refuses to unload models or
 save/regenerate the config (HTTP 409) while a download is running, since that
 would kill it.
 
+### sha256 verification
+
+Every model file the box downloads (chat model, mmproj, draft, image/video
+model files, and the embeddings model) is hashed with sha256 after the download
+completes and compared with an expected hash (`dlverify.py`):
+
+- **HuggingFace URLs** (`https://huggingface.co/<repo>/resolve/<rev>/<file>`):
+  the file's LFS sha256 from the Hub's `paths-info` API for that
+  repo/revision/file. Each successful lookup is cached in
+  `/models/.sha256-cache.json`, and the cached value is used when a later
+  lookup fails (Hub down, no network).
+- **Other URLs**: the optional `sha256` field of the `models.json` entry
+  (64 hex characters; it is the hash of the entry's `url` file and is ignored
+  for HuggingFace URLs).
+
+While hashing, the status shows **verifying** with a percentage. On a
+mismatch the file is deleted and downloaded once more; a second mismatch stops
+with an error that names the file, the hash it got and the hash it expected.
+
+**"Unverified"** means there was nothing to compare against: a non-HF URL
+without a `sha256` field, a file the Hub lists without a sha256 (a small
+non-LFS file), or a failed Hub lookup with no cached hash. The file is used
+anyway, the log prints `WARNING: <file> is UNVERIFIED: <reason>`, and the
+status file carries `"unverified": [<files>]`, which the editor shows as
+"⚠ UNVERIFIED" next to the status. A file is hashed once, right after its
+download; a cached file is not re-hashed on later boots. A `<file>.verify`
+marker exists from the start of a download until its check finishes, so a run
+killed mid-check checks the file again next time instead of trusting it.
+
 The aria2c transfer limits default to aria2's own values and can be tightened
 with env vars when a host's link stalls:
 
@@ -265,7 +294,9 @@ model; other settings still come from params.json/env. While `MODELS` is active
 the editor shows the registry as authoritative; edits to the model rows are
 ignored on save (Settings and Embeddings still save).
 
-Entry fields: `url` (required), `mmproj`, `draft`, the knobs above, `note`.
+Entry fields: `url` (required), `mmproj`, `draft`, the knobs above, `note`,
+`sha256` (expected hash of a non-HuggingFace `url`; see
+[sha256 verification](#sha256-verification)).
 `defaults` also accepts `image_min_tokens`, `image_max_tokens`,
 `mtmd_batch_max_tokens`, `mlock`. Only https URLs; unknown keys and any
 token/secret-like field (the container env keeps `HF_TOKEN`) are rejected.

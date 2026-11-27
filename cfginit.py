@@ -90,7 +90,9 @@ def validate_registry(reg, selected=None):
         if isinstance(m["url"], str) and model_stem(m["url"]) != mid:
             errs.append(f"{w}: id must equal the url's file stem {model_stem(m['url'])!r}")
         if "note" in m and not isinstance(m["note"], str): errs.append(f"{w}.note: must be a string")
-        _check_knobs(w, {k: v for k, v in m.items() if k not in ("note", *URLS)}, knobs, errs)
+        if "sha256" in m and not (isinstance(m["sha256"], str) and re.fullmatch(r"[0-9a-fA-F]{64}", m["sha256"])):
+            errs.append(f"{w}.sha256: must be 64 hex characters")
+        _check_knobs(w, {k: v for k, v in m.items() if k not in ("note", "sha256", *URLS)}, knobs, errs)
     d = reg.get("defaults", {})
     if not isinstance(d, dict): errs.append("defaults: must be an object")
     else: _check_knobs("defaults", d, knobs | set(DEFAULT_ONLY), errs)
@@ -133,6 +135,8 @@ def _registry_rows(reg, selected):
             e = KNOBS.get(k) or DEFAULT_ONLY.get(k)
             if e: env[e] = ("1" if v else "0") if isinstance(v, bool) else str(v)
         if env.get("NO_MTP") == "0": del env["NO_MTP"]
+        # expected sha256 of `url` when it is not a HuggingFace URL (dlverify.py)
+        if m.get("sha256"): env["MODEL_SHA256"] = m["sha256"].lower()
         rows.append({"model_url": m["url"], "mmproj_url": m.get("mmproj", ""),
                      "draft_model_url": m.get("draft", ""), "env": env, "note": m.get("note", "")})
     return rows
