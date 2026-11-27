@@ -9,6 +9,7 @@ Cloudflare tunnel — all behind one URL, which is what SillyTavern wants.
 | Path | Served by | Notes |
 | --- | --- | --- |
 | `/v1/chat/completions`, `/v1/completions`, `/v1/models` | guard → llama-swap | chat model, swapped on demand |
+| `/v1/chat/completions` with `model: media-dossier` | guard → RTR → llama-swap | media pass; see [Media router (RTR)](#media-router-rtr) |
 | `/v1/embeddings` | embed.py sidecar (:8090) | OpenAI-compatible embeddings |
 | `/embedding` | embed.py sidecar (:8090) | llama.cpp's native embedding endpoint |
 | `/editor` | cfgedit | config UI, logs, terminal |
@@ -276,6 +277,44 @@ Set `LLAMA_SWAP_TAG=vNNN` in the container env to use another release, or
 `LLAMA_SWAP_TAG=latest` to take the newest one at boot. The installed version
 is logged at boot (`llama-swap version: ...`). A binary already on `PATH` is
 kept as is.
+
+## Media router (RTR)
+
+`rtr.py` is a small router that `init.sh` starts on `127.0.0.1:$RTR_PORT`
+(default `8082`, loopback only; Caddy is unchanged). guard forwards every chat
+request whose `model` is `media-dossier` to it. RTR runs a media model against
+llama-swap and answers with one non-streaming chat completion: the message
+content (and a top-level `rtr` field) is the result, holding the dossier, a
+`status` (`ok`, `partial` or `failed`), per-step `timings`, the media
+projector's sha256 and the llama.cpp build string (both informational).
+
+The request carries an `rtr` object: `media_model` (a llama-swap model id,
+required), and optionally `rp_model`, `kind` (`dossier` or `delta`),
+`dry_run` (return only the plan: coexist or swap, and what would be evicted)
+and `flush` (queued follow-up questions answered while the media model is
+loaded). Without a `response_format`, RTR asks for the dossier JSON schema; a
+reply that does not validate is repaired once, then returned as `partial`.
+
+RTR keeps the role-play model loaded and runs the media model beside it only
+when llama-swap's config has a coexist set for the pair and `nvidia-smi`
+shows enough free VRAM (the media model's need plus 1 GiB). Otherwise it
+**swaps**: it unloads the role-play model, loads the media model, runs the
+pass, unloads the media model and reloads the role-play model with a
+one-token request. The reload runs even when a step fails.
+
+During a swap guard holds other generation requests until the swap ends, for
+at most `SWAP_HOLD_S` seconds (default `600`). After that the request gets
+`503` with `{"error":{"message":"media swap in progress",...}}` and a
+`Retry-After` header. If RTR is down, guard does not hold anything. RTR logs
+to `/tmp/rtr.log`; a failure to start is logged but does not stop the boot.
+
+| Env | Default | Meaning |
+| --- | --- | --- |
+| `RTR_PORT` | `8082` | RTR's loopback port (guard and RTR both read it) |
+| `SWAP_HOLD_S` | `600` | how long guard holds a request during a swap |
+| `RTR_TIMEOUT_S` | `1800` | guard's timeout for a media request |
+| `RTR_LOAD_TIMEOUT_S` | `900` | RTR's timeout for each load or unload |
+| `RTR_GEN_TIMEOUT_S` | `600` | RTR's timeout for each media generation |
 
 ## Where the model list comes from
 

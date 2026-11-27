@@ -1,6 +1,6 @@
 from http.server import HTTPServer,BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
-import http.client,json,os
+import http.client,json,os,time
 
 UPSTREAM_HOST='localhost'
 UPSTREAM_PORT=8080
@@ -16,6 +16,15 @@ MODELS_PATH='/v1/models'
 EXPOSE_ACTIVE_ONLY_FILE='/app/expose_active_only'
 TRUTHY={'1','true','yes','on'}
 _cache={}
+# Media routing (spec-v2 §1.2): chat requests for the pseudo-model below go to
+# RTR (rtr.py, loopback only). While RTR swaps the RP out for a media model,
+# other generation requests wait here, up to SWAP_HOLD_S, then get a 503.
+MEDIA_MODEL='media-dossier'
+RTR_HOST='127.0.0.1'
+RTR_PORT=int(os.environ.get('RTR_PORT') or 8082)
+RTR_TIMEOUT_S=float(os.environ.get('RTR_TIMEOUT_S') or 1800)  # a swap plus a long clip
+SWAP_HOLD_S=float(os.environ.get('SWAP_HOLD_S') or 600)
+SWAP_POLL_S=0.25
 
 def get_default_model():
     try:
@@ -48,27 +57,64 @@ def filter_models(raw,active):
 class ThreadedHTTPServer(ThreadingMixIn,HTTPServer):
     daemon_threads=True
 
-def get_running():
+def parse_running(d):
+    """Model ids from a llama-swap /running body, in its order.
+    v277: {"running":[{"model":id,"state":"ready"|"starting"|"stopping",...}]};
+    models that are stopping are left out. Older shapes (a bare string, or a
+    dict keyed by model id) still work."""
+    if not isinstance(d,dict) or not d: return []
+    v=d.get('running')
+    if isinstance(v,list):
+        return [x['model'] for x in v if isinstance(x,dict) and isinstance(x.get('model'),str)
+                and x['model'] and x.get('state')!='stopping']
+    if v and isinstance(v,str): return [v]
+    return [k for k in d if k!='running']
+
+def get_running_list():
     try:
         c=http.client.HTTPConnection(UPSTREAM_HOST,UPSTREAM_PORT,timeout=3)
-        c.request('GET','/running'); r=c.getresponse()
-        if r.status==200:
-            d=json.loads(r.read())
-            if isinstance(d,dict) and d:
-                v=d.get('running')
-                if v and isinstance(v,str): return v
-                return next((k for k in d if k!='running'),None)
-        c.close()
+        try:
+            c.request('GET','/running'); r=c.getresponse()
+            if r.status==200: return parse_running(json.loads(r.read()))
+        finally: c.close()
     except: pass
-    return None
+    return []
+
+def get_running():
+    """The running RP: an '@co' variant first (a media model may be loaded
+    beside it), else the first running model."""
+    ids=get_running_list()
+    return next((m for m in ids if '@co' in m),ids[0] if ids else None)
 
 def resolve_model(req_model):
     """Return the model ID that should actually be used for this request.
-    Priority: currently running > DEFAULT_MODEL > requested as-is."""
-    running=get_running()
+    Priority: requested if already running > currently running > DEFAULT_MODEL
+    > requested as-is."""
+    ids=get_running_list()
+    if req_model and req_model in ids: return req_model
+    running=next((m for m in ids if '@co' in m),ids[0] if ids else None)
     if running:
         return running
     return get_default_model() or req_model
+
+def rtr_swapping():
+    """True while RTR has the RP unloaded. False when RTR is unreachable, so a
+    missing RTR never blocks normal chat."""
+    try:
+        c=http.client.HTTPConnection(RTR_HOST,RTR_PORT,timeout=2)
+        try:
+            c.request('GET','/rtr/state'); r=c.getresponse()
+            return r.status==200 and json.loads(r.read()).get('swapping') is True
+        finally: c.close()
+    except: return False
+
+def wait_swap(limit=None):
+    """Block while a media swap runs. True when clear, False after `limit` s."""
+    end=time.time()+(SWAP_HOLD_S if limit is None else limit)
+    while rtr_swapping():
+        if time.time()>=end: return False
+        time.sleep(SWAP_POLL_S)
+    return True
 
 def load_props():
     try: return json.loads(open(STATUS).read())
@@ -104,13 +150,13 @@ class G(BaseHTTPRequestHandler):
         for k,v in hdrs:
             if k.lower() not in ('transfer-encoding','content-length'): self.send_header(k,v)
         self.send_header('Content-Length',len(body)); self.end_headers(); self.wfile.write(body)
-    def forward(self,body=None):
+    def forward(self,body=None,host=None,port=None,timeout=600):
         path=self.path.split('?')[0]
         hdrs={k:v for k,v in self.headers.items()
               if k.lower() not in ('host','content-length','transfer-encoding')}
         if body is not None: hdrs['Content-Length']=str(len(body))
         try:
-            c=http.client.HTTPConnection(UPSTREAM_HOST,UPSTREAM_PORT,timeout=600)
+            c=http.client.HTTPConnection(host or UPSTREAM_HOST,port or UPSTREAM_PORT,timeout=timeout)
             c.request(self.command,self.path,body=body,headers=hdrs)
             r=c.getresponse()
             if path==MODELS_PATH and self.command=='GET':
@@ -155,11 +201,22 @@ class G(BaseHTTPRequestHandler):
     def do_OPTIONS(self):self.forward()
     def do_DELETE(self): self.forward()
     def do_PUT(self):    self.forward(self.read_body())
+    def send_busy(self):
+        b=json.dumps({'error':{'message':'media swap in progress','type':'unavailable_error','code':503}}).encode()
+        self.buf_send(503,[('Content-Type','application/json'),('Retry-After','10')],b)
     def do_POST(self):
         body=self.read_body()
         if self.path.split('?')[0] in GEN_PATHS:
+            try: data=json.loads(body)
+            except: data=None
+            if isinstance(data,dict) and data.get('model')==MEDIA_MODEL:
+                print(f'[guard] {MEDIA_MODEL} -> rtr :{RTR_PORT}',flush=True)
+                return self.forward(body,RTR_HOST,RTR_PORT,RTR_TIMEOUT_S)
+            if not wait_swap():
+                print(f'[guard] held {SWAP_HOLD_S:g}s for a media swap; 503',flush=True)
+                return self.send_busy()
             try:
-                data=json.loads(body); req=data.get('model','')
+                req=data.get('model','')
                 target=resolve_model(req)
                 if target and req!=target:
                     print(f'[guard] rewrote model {req!r} → {target!r}',flush=True)
@@ -167,5 +224,6 @@ class G(BaseHTTPRequestHandler):
             except: pass
         self.forward(body)
 
-print('[guard] starting on 0.0.0.0:8081',flush=True)
-ThreadedHTTPServer(('0.0.0.0',8081),G).serve_forever()
+if __name__=='__main__':
+    print('[guard] starting on 0.0.0.0:8081',flush=True)
+    ThreadedHTTPServer(('0.0.0.0',8081),G).serve_forever()

@@ -56,7 +56,7 @@ update_scripts(){
     # started just after a push can otherwise boot the previous copy. A unique
     # query string plus no-cache skips the edge cache.
     local cb; cb=$(date +%s%N)
-    for f in serve.py dlverify.py cfginit.py cfgedit.py guard.py embed.py imgserve.py models.json; do
+    for f in serve.py dlverify.py cfginit.py cfgedit.py guard.py rtr.py embed.py imgserve.py models.json; do
         if curl -fsSL --max-time 30 -H 'Cache-Control: no-cache' "$base/$f?cb=$cb" -o "/tmp/$f"; then
             LOG "updated $f"
         else
@@ -282,6 +282,14 @@ start_services(){
     python3 /tmp/guard.py > /tmp/guard.log 2>&1 &
     GUARD_PID=$!
     wait_port guard 8081 30 || die "guard failed to bind port 8081"
+
+    # RTR: loopback media router behind guard (media-dossier requests). Not
+    # fatal: without it guard still serves chat, only media passes fail.
+    RTR_PORT=${RTR_PORT:-8082}; export RTR_PORT
+    LOG "starting rtr on 127.0.0.1:$RTR_PORT"
+    python3 /tmp/rtr.py > /tmp/rtr.log 2>&1 &
+    RTR_PID=$!
+    wait_port rtr "$RTR_PORT" 30 || ERR "rtr failed to bind port $RTR_PORT; media-dossier requests will fail"
 
     LOG "starting llama-swap"
     llama-swap --config /app/config.yaml --listen 0.0.0.0:8080 --watch-config \
