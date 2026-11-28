@@ -2,7 +2,9 @@
 """Video upload test page + same-origin proxy to OpenAI-compatible endpoints.
 
 Stdlib only. Serves index.html and forwards POST /proxy and GET /models to the
-chosen endpoint. API keys come from env VIDEOTEST_KEY_<NAME> (never files) or,
+chosen endpoint. GET /v1/models and POST /v1/chat/completions are an
+OpenAI-compatible pass-through to the "home" endpoint (base URL
+https://<host>/v1), non-streaming only: a request with "stream": true gets a 400. API keys come from env VIDEOTEST_KEY_<NAME> (never files) or,
 for the "custom" endpoint, the X-Custom-Key request header (held in memory only).
 Request/response bodies are never logged. Redirects are not followed.
 """
@@ -17,6 +19,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MAX_BODY = 200 * 1024 * 1024
 TIMEOUT = 300
 PORT = int(os.environ.get("VIDEOTEST_PORT", "18810"))
+# OpenAI-style paths (with or without a trailing slash) forwarded to "home".
+V1_ENDPOINT = {"endpoint": ["home"]}
 
 
 def load_endpoints():
@@ -81,27 +85,43 @@ class Handler(BaseHTTPRequestHandler):
                 [{"name": n, "custom": v.get("base") is None} for n, v in eps.items()]))
         if u.path == "/models":
             return self._forward("GET", "/models", q, None)
+        if u.path.rstrip("/") == "/v1/models":
+            return self._forward("GET", "/models", V1_ENDPOINT, None)
         self._err(404, "not found")
 
     def do_POST(self):
         u = urllib.parse.urlsplit(self.path)
-        if u.path != "/proxy":
+        v1 = u.path.rstrip("/") == "/v1/chat/completions"
+        if u.path != "/proxy" and not v1:
             return self._err(404, "not found")
-        q = urllib.parse.parse_qs(u.query)
+        q = V1_ENDPOINT if v1 else urllib.parse.parse_qs(u.query)
         try:
             n = int(self.headers.get("Content-Length", ""))
         except ValueError:
             return self._err(411, "Content-Length required")
         if n > MAX_BODY:
             return self._err(413, "body exceeds %d MB" % (MAX_BODY >> 20))
-        self._forward("POST", "/chat/completions", q, n)
+        if not v1:
+            return self._forward("POST", "/chat/completions", q, n)
+        # The pass-through reads the body to refuse streaming: the forwarder
+        # returns the whole reply at once, which an SSE client cannot parse.
+        body = self.rfile.read(n)
+        try:
+            req = json.loads(body)
+        except ValueError:
+            return self._err(400, "body must be JSON")
+        if isinstance(req, dict) and req.get("stream"):
+            return self._err(400, "streaming is not supported here; turn streaming off")
+        self._forward("POST", "/chat/completions", q, n, body)
 
-    def _forward(self, method, sub, q, length):
+    def _forward(self, method, sub, q, length, body=None):
+        """Forward to the endpoint named in q. The request body is streamed
+        from the client (length bytes) unless it was already read (body)."""
         try:
             scheme, host, port, prefix, key = resolve(
                 (q.get("endpoint") or [""])[0], q, self.headers)
         except ValueError as e:
-            if length:  # drain so the connection stays sane
+            if length and body is None:  # drain so the connection stays sane
                 self.rfile.read(length)
             return self._err(400, str(e))
         cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
@@ -115,7 +135,9 @@ class Handler(BaseHTTPRequestHandler):
                 conn.putheader("Content-Type", "application/json")
                 conn.putheader("Content-Length", str(length))
             conn.endheaders()
-            left = length or 0
+            if body is not None:
+                conn.send(body)
+            left = 0 if body is not None else (length or 0)
             while left:  # stream-forward in chunks, no full buffering
                 chunk = self.rfile.read(min(1 << 20, left))
                 if not chunk:

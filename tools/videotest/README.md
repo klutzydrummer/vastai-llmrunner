@@ -16,6 +16,10 @@ python3 tools/videotest/server.py          # listens on 0.0.0.0:18810 (VIDEOTEST
 
 Open `http://<host>:18810/` on a desktop or phone. The same-origin proxy (`POST /proxy`, `GET /models`) forwards to the endpoint you pick, so there is no CORS setup. Uploads up to 200 MB are streamed, with a 300 s upstream timeout.
 
+## OpenAI-compatible pass-through
+
+`GET /v1/models` and `POST /v1/chat/completions` (a trailing slash is accepted) forward to the `home` endpoint through the same forwarder, so an OpenAI client such as SillyTavern's Custom (OpenAI-compatible) source can use `https://<host>/v1` as its base URL. The upstream status code and JSON body are returned unchanged. Streaming is not supported, because the forwarder returns the whole reply at once: a request with `"stream": true` gets a 400 asking you to turn streaming off. The server sets no CORS headers, so browser clients must go through a backend proxy (as TauriTavern does).
+
 ## Endpoints
 
 `endpoints.json` maps a name to a base URL. `home` is `http://127.0.0.1:18800/v1`. An entry with `"base": null` (`custom`) takes a base URL typed in the page; only http and https are accepted.
