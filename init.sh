@@ -390,7 +390,10 @@ _launch_rtr(){
 
 tunnel_watchdog(){
     local max_restarts=10 restarts=0
-    local rtr_max=5 rtr_restarts=0
+    # RTR backoff: 5 s, 10, 20, ... capped at 300 s; reset to 5 s once RTR has
+    # stayed up 120 s. Timestamps ($SECONDS), so the loop never blocks on it.
+    local rtr_delay_min=5 rtr_delay_max=300 rtr_stable_s=120
+    local rtr_delay=5 rtr_restarts=0 rtr_next=-1 rtr_up_at=$SECONDS
     _launch_cloudflared
     LOG "cloudflared started (pid=$TUNNEL_PID)"
 
@@ -407,17 +410,27 @@ tunnel_watchdog(){
             _launch_cloudflared
             LOG "cloudflared restarted (pid=$TUNNEL_PID)"
         fi
-        # RTR (media router): restart when it exits, capped. Chat never waits on
-        # it; guard answers media-dossier with a JSON 503 while it is down.
-        if [ -n "${RTR_PID:-}" ] && (( rtr_restarts <= rtr_max )) && ! kill -0 "$RTR_PID" 2>/dev/null; then
-            rtr_restarts=$(( rtr_restarts + 1 ))
-            if (( rtr_restarts > rtr_max )); then
-                ERR "rtr died $rtr_max times; continuing without media routing"
+        # RTR (media router): restart whenever it exits, unlimited, with growing
+        # backoff. Chat never waits on it; guard answers media-dossier with a
+        # JSON 503 while it is down.
+        if [ -n "${RTR_PID:-}" ]; then
+            if kill -0 "$RTR_PID" 2>/dev/null; then
+                if (( rtr_delay > rtr_delay_min && SECONDS - rtr_up_at >= rtr_stable_s )); then
+                    rtr_delay=$rtr_delay_min
+                fi
             else
-                ERR "rtr exited unexpectedly (restart $rtr_restarts/$rtr_max)"
-                tail -5 /tmp/rtr.log >&2
-                _launch_rtr
-                LOG "rtr restarted (pid=$RTR_PID)"
+                if (( rtr_next < 0 )); then
+                    rtr_restarts=$(( rtr_restarts + 1 ))
+                    ERR "rtr exited unexpectedly (restart $rtr_restarts in ${rtr_delay}s)"
+                    tail -5 /tmp/rtr.log >&2
+                    rtr_next=$(( SECONDS + rtr_delay ))
+                fi
+                if (( SECONDS >= rtr_next )); then
+                    _launch_rtr
+                    LOG "rtr restarted (pid=$RTR_PID, restart $rtr_restarts)"
+                    rtr_up_at=$SECONDS rtr_next=-1
+                    rtr_delay=$(( rtr_delay * 2 > rtr_delay_max ? rtr_delay_max : rtr_delay * 2 ))
+                fi
             fi
         fi
         sleep 5

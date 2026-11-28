@@ -336,15 +336,19 @@ at most `SWAP_HOLD_S` seconds (default `600`). After that the request gets
 `media-dossier` request gets `503` with
 `{"error":{"message":"media router unavailable","type":"service_unavailable"}}`.
 RTR logs to `/tmp/rtr.log`; a failure to start is logged but does not stop the
-boot. The boot watchdog restarts RTR when it exits, up to 5 times, logging
-each restart.
+boot. The boot watchdog restarts RTR whenever it exits, with no limit, logging
+each restart. The wait before a restart doubles from 5 s (5, 10, 20, ...) up
+to a maximum of 300 s, and goes back to 5 s once RTR has stayed up for 120 s.
 
 For a browser client on another origin, guard answers CORS preflights
 (`OPTIONS` with `Access-Control-Request-Method`, `204`) on the generation paths
 and adds `Access-Control-Allow-Origin` to `media-dossier` responses. By default
-only loopback origins (`localhost`, `127.0.0.1`, `[::1]`, `*.localhost`, over
-`http`, `https` or `tauri`) are allowed; `RTR_CORS_ORIGINS` adds exact origins
-(comma-separated) or `*`. This adds headers on the existing path only; no port
+any origin is allowed (the request's origin is echoed; no credentials). This is
+open on purpose for now and is to be secured later (see
+[docs/known-issues.md](docs/known-issues.md)). Setting `RTR_CORS_ORIGINS`
+(exact origins, comma-separated, or `*`) restricts it to that list; loopback
+origins (`localhost`, `127.0.0.1`, `[::1]`, `*.localhost`, over `http`,
+`https` or `tauri`) stay allowed then. This adds headers on the existing path only; no port
 is opened. Real browser behaviour is untested.
 
 After a swap the role-play model starts with an empty cache, so its next reply
@@ -359,7 +363,7 @@ other open limits.
 | `RTR_TIMEOUT_S` | `1800` | guard's timeout for a media request |
 | `RTR_LOAD_TIMEOUT_S` | `900` | RTR's timeout for each load or unload |
 | `RTR_GEN_TIMEOUT_S` | `600` | RTR's timeout for each media generation |
-| `RTR_CORS_ORIGINS` | *(loopback only)* | extra origins allowed to call `media-dossier` from a browser, comma-separated, or `*` |
+| `RTR_CORS_ORIGINS` | *(any origin)* | when set, only these origins (plus loopback) may call `media-dossier` from a browser; comma-separated, or `*` |
 
 ## Where the model list comes from
 

@@ -54,6 +54,17 @@
   against the real programs. Wrong VRAM or version data falls back to swap or
   is informational only.
 
+- CORS on the media route is open to any origin. By default guard echoes any
+  browser `Origin` back on `media-dossier` responses and preflights (no
+  credentials header). The user's decision: "Allow any origin, but make note
+  that we'll secure it later". To be secured later; until then
+  `RTR_CORS_ORIGINS` can restrict it to a list.
+- Watchdog cloudflared fall-through (logged, not fixed; user: "Log it, fix
+  later"). In `init.sh` `tunnel_watchdog`, after cloudflared dies more than 10
+  times the `break` leaves the loop and falls through to "llama-swap has
+  exited — shutting down" and `exit 1`, even when llama-swap is still alive.
+  That also ends RTR supervision.
+
 ## Run 2 measurement items
 Not measured yet; to be timed on the next approved rental (Run 2). None of
 these is run or approved by this repo.

@@ -26,16 +26,19 @@ RTR_TIMEOUT_S=float(os.environ.get('RTR_TIMEOUT_S') or 1800)  # a swap plus a lo
 SWAP_HOLD_S=float(os.environ.get('SWAP_HOLD_S') or 600)
 SWAP_POLL_S=0.25
 # CORS for media-dossier requests sent straight from a browser (the SillyTavern
-# extension). Allowed origins: RTR_CORS_ORIGINS, comma-separated exact origins
-# ("*" = any). Loopback origins (localhost, *.localhost, 127.0.0.1, [::1], any
-# port, http/https/tauri) are always allowed: they are the same machine.
+# extension). Default: ANY origin is allowed (user decision; to be secured
+# later, see docs/known-issues.md). The request's Origin is echoed back with
+# Vary: Origin; no Access-Control-Allow-Credentials is ever sent. Setting
+# RTR_CORS_ORIGINS (comma-separated exact origins, "*" = any) restricts it to
+# that list; loopback origins (localhost, *.localhost, 127.0.0.1, [::1], any
+# port, http/https/tauri) stay allowed then too: they are the same machine.
 RTR_CORS_ORIGINS=os.environ.get('RTR_CORS_ORIGINS','')
 CORS_LOOPBACK={'localhost','127.0.0.1','::1'}
 
 def cors_allowed(origin):
     if not origin: return False
     allow={o.strip().rstrip('/') for o in RTR_CORS_ORIGINS.split(',') if o.strip()}
-    if '*' in allow or origin.rstrip('/') in allow: return True
+    if not allow or '*' in allow or origin.rstrip('/') in allow: return True
     try: u=urllib.parse.urlsplit(origin); host=(u.hostname or '').lower()
     except ValueError: return False
     return u.scheme in ('http','https','tauri') and (host in CORS_LOOPBACK or host.endswith('.localhost'))

@@ -534,25 +534,32 @@ class GuardRtrDownCors(GuardBase):
             self.assertEqual(code,204,o); self.assertEqual(r.getheader('Access-Control-Allow-Origin'),o)
             self.assertIn('POST',r.getheader('Access-Control-Allow-Methods'))
             self.assertEqual(r.getheader('Access-Control-Allow-Headers'),'content-type')
-    def test_preflight_other_origin_not_allowed(self):
-        code,r=self.preflight('https://evil.example')
-        self.assertNotEqual(code,204); self.assertIsNone(r.getheader('Access-Control-Allow-Origin'))
+    def test_preflight_any_origin_by_default(self):
+        code,r=self.preflight('https://phone.example')
+        self.assertEqual(code,204); self.assertEqual(r.getheader('Access-Control-Allow-Origin'),'https://phone.example')
+        self.assertIsNone(r.getheader('Access-Control-Allow-Credentials'))
     def test_allow_list_env(self):
         with mock.patch.object(guard,'RTR_CORS_ORIGINS','https://st.example.net, https://x.example'):
             self.assertEqual(self.preflight('https://st.example.net')[0],204)
             code,raw,r=self.post('https://st.example.net')
             self.assertEqual((code,r.getheader('Access-Control-Allow-Origin')),(200,'https://st.example.net'))
-            self.assertNotEqual(self.preflight('https://other.example')[0],204)
+            code,r=self.preflight('https://other.example')
+            self.assertNotEqual(code,204); self.assertIsNone(r.getheader('Access-Control-Allow-Origin'))
+            code,raw,r=self.post('https://other.example')
+            self.assertEqual(code,200); self.assertIsNone(r.getheader('Access-Control-Allow-Origin'))
+            self.assertEqual(self.preflight('http://localhost:8000')[0],204)  # loopback stays allowed
+            self.assertFalse(guard.cors_allowed('https://localhost.evil.example')); self.assertFalse(guard.cors_allowed('null'))
+            self.assertFalse(guard.cors_allowed('ftp://localhost'))
         with mock.patch.object(guard,'RTR_CORS_ORIGINS','*'):
             self.assertTrue(guard.cors_allowed('https://anything.example'))
-        self.assertFalse(guard.cors_allowed('https://localhost.evil.example')); self.assertFalse(guard.cors_allowed('null'))
-        self.assertFalse(guard.cors_allowed('ftp://localhost'))
+        self.assertTrue(guard.cors_allowed('https://anything.example')); self.assertFalse(guard.cors_allowed(''))
     def test_post_media_cors_headers(self):
         code,raw,r=self.post('http://localhost:8000')
         self.assertEqual(code,200); self.assertEqual(r.getheader('Access-Control-Allow-Origin'),'http://localhost:8000')
         self.assertEqual(r.getheader('Vary'),'Origin')
-        code,raw,r=self.post('https://evil.example')
-        self.assertEqual(code,200); self.assertIsNone(r.getheader('Access-Control-Allow-Origin'))
+        self.assertIsNone(r.getheader('Access-Control-Allow-Credentials'))
+        code,raw,r=self.post('https://evil.example')  # default: any origin
+        self.assertEqual(code,200); self.assertEqual(r.getheader('Access-Control-Allow-Origin'),'https://evil.example')
         with mock.patch.object(guard,'RTR_PORT',1):
             code,raw,r=self.post('http://localhost:8000')
         self.assertEqual((code,r.getheader('Access-Control-Allow-Origin')),(503,'http://localhost:8000'))
@@ -614,11 +621,44 @@ class InitWiring(unittest.TestCase):
     def test_watchdog_restarts_rtr(self):
         wd=self.sh[self.sh.index('tunnel_watchdog(){'):]; wd=wd[:wd.index('\n}\n')]
         self.assertIn('kill -0 "$RTR_PID"',wd)
-        self.assertIn('rtr_max=5',wd); self.assertIn('(( rtr_restarts > rtr_max ))',wd)
-        self.assertIn('ERR "rtr exited unexpectedly (restart $rtr_restarts/$rtr_max)"',wd)
-        self.assertIn('LOG "rtr restarted (pid=$RTR_PID)"',wd); self.assertIn('_launch_rtr',wd)
+        self.assertNotIn('rtr_max',wd)  # unlimited restarts
+        self.assertIn('rtr_delay_min=5 rtr_delay_max=300 rtr_stable_s=120',wd)
+        self.assertIn('rtr_next=$(( SECONDS + rtr_delay ))',wd); self.assertIn('(( SECONDS >= rtr_next ))',wd)
+        self.assertIn('rtr_delay * 2 > rtr_delay_max ? rtr_delay_max : rtr_delay * 2',wd)
+        self.assertIn('SECONDS - rtr_up_at >= rtr_stable_s',wd)
+        self.assertIn('ERR "rtr exited unexpectedly (restart $rtr_restarts in ${rtr_delay}s)"',wd)
+        self.assertIn('LOG "rtr restarted (pid=$RTR_PID, restart $rtr_restarts)"',wd); self.assertIn('_launch_rtr',wd)
         self.assertNotIn('break',wd[wd.index('rtr_restarts=$(( rtr_restarts + 1 ))'):])  # RTR never ends the loop
         self.assertIn('python3 /tmp/rtr.py >> /tmp/rtr.log',self.sh)
+    WD_STUBS = r'''
+LOG(){ :; }; ERR(){ :; }; tail(){ :; }
+sleep(){ SECONDS=$(( SECONDS + $1 )); }
+_launch_cloudflared(){ TUNNEL_PID=$$; }
+DEAD=999999; while kill -0 $DEAD 2>/dev/null; do DEAD=$((DEAD-1)); done
+n=0; up=${UP:-0}; STAY=0
+_launch_rtr(){ n=$((n+1)); echo "launch $SECONDS"
+  if (( up && n == 3 )); then RTR_PID=$PPID; STAY=$((SECONDS+130)); else RTR_PID=$DEAD; fi; }
+kill(){ if [ "$2" = "$LLAMA_SWAP_PID" ] && (( n >= STOP )); then return 1; fi
+  if [ "$2" = "$RTR_PID" ] && (( STAY && SECONDS >= STAY )); then RTR_PID=$DEAD; STAY=0; up=0; return 1; fi
+  builtin kill "$@"; }
+LLAMA_SWAP_PID=$$; RTR_PID=$DEAD; SECONDS=0
+'''
+    def run_watchdog(self,env):
+        import subprocess
+        wd=self.sh[self.sh.index('tunnel_watchdog(){'):]; wd=wd[:wd.index('\n}\n')+3]
+        r=subprocess.run(['bash','-c',self.WD_STUBS+wd+'\ntunnel_watchdog\n'],capture_output=True,
+                         text=True,timeout=30,env={**os.environ,**env})
+        self.assertEqual(r.returncode,1,r.stderr)
+        return [int(l.split()[1]) for l in r.stdout.splitlines() if l.startswith('launch')]
+    def test_watchdog_rtr_backoff_behaviour(self):
+        """Runs the real tunnel_watchdog in bash with stubs; sleep advances $SECONDS.
+        RTR dies at once after each launch; each gap is the backoff plus the 5 s tick to notice."""
+        t=self.run_watchdog({'STOP':'8'})
+        self.assertEqual([b-a for a,b in zip([0]+t,t)],[5,15,25,45,85,165,305,305])  # 5,10,..,300 cap, unlimited
+        # RTR stays up 130 s (>= 120 s) after the 3rd launch: the next delay is back to 5 s
+        t=self.run_watchdog({'STOP':'5','UP':'1'})
+        self.assertEqual([b-a for a,b in zip([0]+t,t)][:3],[5,15,25])
+        self.assertEqual(t[3]-(t[2]+130),5)
     def test_caddyfile_unchanged_by_rtr(self):
         self.assertNotIn('8082',self.sh[self.sh.find('Caddyfile'):self.sh.find('Caddyfile')+2000] if 'Caddyfile' in self.sh else '')
 
