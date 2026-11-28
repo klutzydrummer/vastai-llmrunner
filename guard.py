@@ -1,6 +1,6 @@
 from http.server import HTTPServer,BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
-import http.client,json,os,time
+import http.client,json,os,time,urllib.parse
 
 UPSTREAM_HOST='localhost'
 UPSTREAM_PORT=8080
@@ -25,6 +25,28 @@ RTR_PORT=int(os.environ.get('RTR_PORT') or 8082)
 RTR_TIMEOUT_S=float(os.environ.get('RTR_TIMEOUT_S') or 1800)  # a swap plus a long clip
 SWAP_HOLD_S=float(os.environ.get('SWAP_HOLD_S') or 600)
 SWAP_POLL_S=0.25
+# CORS for media-dossier requests sent straight from a browser (the SillyTavern
+# extension). Allowed origins: RTR_CORS_ORIGINS, comma-separated exact origins
+# ("*" = any). Loopback origins (localhost, *.localhost, 127.0.0.1, [::1], any
+# port, http/https/tauri) are always allowed: they are the same machine.
+RTR_CORS_ORIGINS=os.environ.get('RTR_CORS_ORIGINS','')
+CORS_LOOPBACK={'localhost','127.0.0.1','::1'}
+
+def cors_allowed(origin):
+    if not origin: return False
+    allow={o.strip().rstrip('/') for o in RTR_CORS_ORIGINS.split(',') if o.strip()}
+    if '*' in allow or origin.rstrip('/') in allow: return True
+    try: u=urllib.parse.urlsplit(origin); host=(u.hostname or '').lower()
+    except ValueError: return False
+    return u.scheme in ('http','https','tauri') and (host in CORS_LOOPBACK or host.endswith('.localhost'))
+
+def cors_headers(origin,req_headers=None):
+    """Response headers for an allowed origin; [] when it is not allowed."""
+    if not cors_allowed(origin): return []
+    return [('Access-Control-Allow-Origin',origin),('Vary','Origin'),
+            ('Access-Control-Allow-Methods','POST, OPTIONS'),
+            ('Access-Control-Allow-Headers',req_headers or 'Content-Type, Authorization'),
+            ('Access-Control-Expose-Headers','Retry-After'),('Access-Control-Max-Age','600')]
 
 def get_default_model():
     try:
@@ -143,6 +165,10 @@ def synth(path):
     return json.dumps(body).encode()
 
 class G(BaseHTTPRequestHandler):
+    _cors=()   # CORS headers added to every response of this request (media route only)
+    def end_headers(self):
+        for k,v in self._cors: self.send_header(k,v)
+        super().end_headers()
     def log_message(self,fmt,*a):
         print(f'[guard] {self.address_string()} {fmt%a}',flush=True)
     def buf_send(self,status,hdrs,body):
@@ -150,13 +176,17 @@ class G(BaseHTTPRequestHandler):
         for k,v in hdrs:
             if k.lower() not in ('transfer-encoding','content-length'): self.send_header(k,v)
         self.send_header('Content-Length',len(body)); self.end_headers(); self.wfile.write(body)
-    def forward(self,body=None,host=None,port=None,timeout=600):
+    def forward(self,body=None,host=None,port=None,timeout=600,down=None):
         path=self.path.split('?')[0]
         hdrs={k:v for k,v in self.headers.items()
               if k.lower() not in ('host','content-length','transfer-encoding')}
         if body is not None: hdrs['Content-Length']=str(len(body))
         try:
             c=http.client.HTTPConnection(host or UPSTREAM_HOST,port or UPSTREAM_PORT,timeout=timeout)
+            if down:
+                try: c.connect()
+                except OSError as e:
+                    print(f'[guard] {host}:{port} unreachable: {e}',flush=True); return down()
             c.request(self.command,self.path,body=body,headers=hdrs)
             r=c.getresponse()
             if path==MODELS_PATH and self.command=='GET':
@@ -198,11 +228,24 @@ class G(BaseHTTPRequestHandler):
     def read_body(self):
         return self.rfile.read(int(self.headers.get('Content-Length',0)))
     def do_GET(self):    self.forward()
-    def do_OPTIONS(self):self.forward()
+    def do_OPTIONS(self):
+        # CORS preflight for the media route. Its path is the chat path, so any
+        # preflight there from an allowed origin is answered here; others go upstream.
+        h=self.headers
+        if self.path.split('?')[0] in GEN_PATHS and h.get('Access-Control-Request-Method'):
+            cors=cors_headers(h.get('Origin'),h.get('Access-Control-Request-Headers'))
+            if cors:
+                self._cors=cors; self.send_response(204)
+                self.send_header('Content-Length','0'); self.end_headers(); return
+        self.forward()
     def do_DELETE(self): self.forward()
     def do_PUT(self):    self.forward(self.read_body())
     def send_busy(self):
         b=json.dumps({'error':{'message':'media swap in progress','type':'unavailable_error','code':503}}).encode()
+        self.buf_send(503,[('Content-Type','application/json'),('Retry-After','10')],b)
+    def send_rtr_down(self):
+        # #13: RTR not listening (init.sh's watchdog restarts it): OpenAI-style JSON, not an HTML 502
+        b=json.dumps({'error':{'message':'media router unavailable','type':'service_unavailable'}}).encode()
         self.buf_send(503,[('Content-Type','application/json'),('Retry-After','10')],b)
     def do_POST(self):
         body=self.read_body()
@@ -211,7 +254,8 @@ class G(BaseHTTPRequestHandler):
             except: data=None
             if isinstance(data,dict) and data.get('model')==MEDIA_MODEL:
                 print(f'[guard] {MEDIA_MODEL} -> rtr :{RTR_PORT}',flush=True)
-                return self.forward(body,RTR_HOST,RTR_PORT,RTR_TIMEOUT_S)
+                self._cors=cors_headers(self.headers.get('Origin'))
+                return self.forward(body,RTR_HOST,RTR_PORT,RTR_TIMEOUT_S,down=self.send_rtr_down)
             if not wait_swap():
                 print(f'[guard] held {SWAP_HOLD_S:g}s for a media swap; 503',flush=True)
                 return self.send_busy()

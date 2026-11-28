@@ -1,10 +1,11 @@
 """RTR media router and guard wiring (spec-v2 §1.2, §1.8, §3.4, §7, §8a).
 Runs on the P4 fakes: loopback only, no GPU, no network, no real models.
 
-Brief labels -> spec §8a labels:
-  T-F1 (brief: happy swap order + reload)          ~ §8a T-F1 state machine
-  T-F2 (brief: failure at each step still reloads)  ~ §8a T-F1 failure rows + T-F3 schema/repair/partial
-  T-F3 (brief: guard hold / 503 / forward)          ~ §8a T-F1 mid-swap hold + T-F2 routing/forwarding
+Test labels follow spec-v2 §8a:
+  T-F1 state machine: SwapStateMachine, FailuresReload (the `finally` reload),
+       SameModel, GuardHold (mid-swap hold, 503 on timeout)
+  T-F2 routing: GuardHold (media-dossier forwarded to RTR), GuardRtrDownCors, ModelsList
+  T-F3 schema: SchemaAndParse, FailuresReload repair/partial rows, FlushRepair
 """
 import hashlib,http.client,json,os,sys,tempfile,threading,time,unittest
 ROOT=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -129,7 +130,11 @@ class ConfigAndPlan(Base):
     def test_pick_rp(self):
         self.assertEqual(rtr.Router.pick_rp([MM,RP],{MM}),RP)
         self.assertEqual(rtr.Router.pick_rp([RP,CO,MM],{MM}),CO)
-        self.assertIsNone(rtr.Router.pick_rp([MM],{MM}))
+        self.assertIsNone(rtr.Router.pick_rp([],{MM},MM))
+        # a running media model counts as the RP (user decision on B3/B4)
+        self.assertEqual(rtr.Router.pick_rp([MM],{MM},MM),MM)
+        self.assertEqual(rtr.Router.pick_rp([MM2],{MM,MM2},MM),MM2)
+        self.assertEqual(rtr.Router.pick_rp([MM,MM2],{MM,MM2},MM),MM2)   # another media id before mm itself
     def test_plan_modes(self):
         p=self.router.plan
         self.assertEqual(p(MM,RP,[RP])['mode'],'swap')                    # no set for the plain RP
@@ -153,8 +158,8 @@ class ConfigAndPlan(Base):
         self.assertEqual(self.run_req(media_req(kind='nope'))[0],400)
         r=media_req(); del r['messages']; self.assertEqual(self.run_req(r)[0],400)
 
-class TF1HappySwap(Base):
-    """Brief T-F1 / §8a T-F1: lock -> unload RP -> load MM -> extract -> unload MM -> reload RP -> unlock."""
+class SwapStateMachine(Base):
+    """§8a T-F1: lock -> unload RP -> load MM -> extract -> unload MM -> reload RP -> unlock."""
     def test_swap_order_and_result(self):
         code,b=self.run_req()
         self.assertEqual(code,200,b); res=b['rtr']
@@ -231,8 +236,9 @@ class TF1HappySwap(Base):
         self.assertEqual(ev,[('unload',RP),('load_start',MM),('unload',MM),('load_start',RP),
                              ('unload',RP),('load_start',MM),('unload',MM),('load_start',RP)])
 
-class TF2FailuresReload(Base):
-    """Brief T-F2: a failure at every step still ends with the RP loaded (`finally`)."""
+class FailuresReload(Base):
+    """§8a T-F1 failure rows (a failure at every step still ends with the RP loaded,
+    `finally`) and T-F3 repair/partial."""
     def check_failed(self,step):
         code,b=self.run_req()
         self.assertEqual(code,502,b); self.assertEqual(b['error']['step'],step)
@@ -311,6 +317,104 @@ class TF2FailuresReload(Base):
         code,b=self.run_req(); self.assertEqual((code,b['error']['step']),(502,'running'))
         self.assertFalse(self.router.state()['busy'])
 
+class SameModel(Base):
+    """§8a T-F1, same model (user: "Count it as RP + skip reload"): a running media
+    model counts as the RP; when rp == media model it is loaded once and kept."""
+    def mm_req(self,**kw): return self.run_req(media_req(**kw))
+    def test_b2_rp_is_media_model_loaded_once_kept(self):
+        code,b=self.mm_req(rp_model=MM); res=b['rtr']
+        self.assertEqual((code,res['status'],res['mode'],res['rp_model']),(200,'ok','swap',MM),res)
+        self.assertEqual(res['plan']['would_evict'],[RP])
+        self.assertEqual(len(self.seq('load_start',MM)),1)       # one load, no reload
+        self.assertEqual(self.seq('unload',MM),[])
+        self.assertEqual(self.seq('request',MM,max_tokens=1),[])
+        self.assertEqual(res['rp_reload'],{'ok':True,'attempts':0,'kept':True})
+        self.assertNotIn('unload_mm_s',res['timings']); self.assertNotIn('reload_rp_s',res['timings'])
+        self.assertIn(MM,self.ls.running()); self.assertTrue(res['rp_vision'])
+        self.assertEqual(self.router.state(),{'swapping':False,'busy':False,'since':None})
+    def test_b2_failure_still_restores_media_rp(self):
+        self.ls.control({'model':MM,'modes':['error500']})      # one failed extract, then healthy
+        code,b=self.mm_req(rp_model=MM); res=b['rtr']
+        self.assertEqual((code,res['status'],res['step']),(502,'failed','extract'))
+        self.assertTrue(res['rp_reload']['ok']); self.assertIn(MM,self.ls.running())
+    def test_b3_running_media_rp_no_swap(self):
+        self.ls.unload(RP); call(self.ls.port,'GET',f'/upstream/{MM}/health'); n0=len(self.ls.events())
+        code,b=self.mm_req(); res=b['rtr']
+        self.assertEqual((code,res['status'],res['mode'],res['rp_model']),(200,'ok','coexist',MM),res)
+        new=[e for e in self.ls.events() if e['seq']>n0]
+        self.assertEqual([e for e in new if e['ev'] in ('unload','evict','load_start')],[])
+        self.assertEqual(self.ls.running(),[MM]); self.assertNotIn('rp_reload',res)
+    def test_b4_other_media_rp_reloaded(self):
+        self.ls.unload(RP); call(self.ls.port,'POST','/v1/chat/completions',{'model':MM2,'max_tokens':1,'messages':[]})
+        code,b=self.mm_req(); res=b['rtr']
+        self.assertEqual((code,res['status'],res['mode'],res['rp_model']),(200,'ok','swap',MM2),res)
+        self.assertEqual(res['plan']['would_evict'],[MM2])
+        self.assertLess(self.seq('unload',MM2)[0],self.seq('load_start',MM)[0])
+        self.assertLess(self.seq('unload',MM)[0],self.seq('request',MM2,max_tokens=1)[-1])
+        self.assertTrue(res['rp_reload']['ok']); self.assertEqual(self.ls.running(),[MM2])
+        self.assertFalse(res['rp_vision'])                        # MM2 has a blank MMPROJ_URL
+
+class FlushRepair(Base):
+    """§8a T-F3 (P3 #8): flushed requeries get the same repair pass as first passes."""
+    def test_flush_item_repaired_while_mm_resident(self):
+        self.ls.control({'model':MM,'modes':['auto','malformed','dossier']})
+        fl=[{'id':'r1','messages':[{'role':'user','content':'[{"id":"q7"}] again'}]}]
+        code,b=self.run_req(media_req(flush=fl)); f=b['rtr']['flushed'][0]
+        self.assertEqual((code,f['status'],f['repaired'],f['errors']),(200,'ok',True,[]))
+        self.assertEqual(rtr.validate_delta(f['delta']),[])
+        x=self.seq('request',MM,path='/v1/chat/completions'); self.assertEqual(len(x),3)
+        self.assertLess(x[2],self.seq('unload',MM)[0])
+    def test_flush_repair_fails_partial(self):
+        self.ls.control({'model':MM,'modes':['auto','malformed','malformed']})
+        fl=[{'id':'r1','messages':[{'role':'user','content':'again'}]}]
+        f=self.run_req(media_req(flush=fl))[1]['rtr']['flushed'][0]
+        self.assertEqual((f['status'],f['repaired']),('partial',True)); self.assertTrue(f['errors'])
+    def test_flush_valid_not_repaired(self):
+        fl=[{'id':'r1','messages':[{'role':'user','content':'again'}]}]
+        f=self.run_req(media_req(flush=fl))[1]['rtr']['flushed'][0]
+        self.assertEqual((f['status'],f['repaired']),('ok',False))
+        self.assertEqual(len(self.seq('request',MM,path='/v1/chat/completions')),2)
+
+class ResultExtras(Base):
+    """Result fields consumed by the SillyTavern side: rp_vision, co_set, gpu, timings.prefill_rp_s."""
+    def coexist(self):
+        self.ls.unload(RP); call(self.ls.port,'POST','/v1/chat/completions',{'model':CO,'max_tokens':1,'messages':[]})
+        self.free[0]=9000
+    def test_swap_fields(self):
+        res=self.run_req()[1]['rtr']
+        self.assertIs(res['rp_vision'],False)                     # RP's entry has no MMPROJ_URL
+        self.assertIsNone(res['co_set']); self.assertIsNone(res['gpu'])  # no set, planner read no VRAM, no GPU info
+        self.assertIn('prefill_rp_s',res['timings']); self.assertIsNone(res['timings']['prefill_rp_s'])
+    def test_coexist_fields_and_gpu(self):
+        self.router.gpu_info_fn=lambda:{'name':'Fake A6000','total_mb':49140}; self.router.boot().join(5)
+        self.coexist(); res=self.run_req()[1]['rtr']
+        self.assertEqual((res['mode'],res['co_set'],res['plan']['co_set']),('coexist','co1','co1'))
+        self.assertEqual(res['gpu'],{'name':'Fake A6000','total_mb':49140,'free_mb':9000,'need_mb':4000,'margin_mb':1024})
+        self.assertIsNone(res['timings']['prefill_rp_s'])
+    def test_co_set_reported_when_swap_needed(self):
+        self.coexist(); self.free[0]=100
+        res=self.run_req()[1]['rtr']
+        self.assertEqual((res['mode'],res['co_set'],res['gpu']['free_mb']),('swap','co1',100))
+    def test_rp_vision_from_config(self):
+        with open(self.cfg) as f: y=f.read()
+        with open(self.cfg,'w') as f: f.write(y.replace(f'      - "MODEL_ID={RP}"',f'      - "MMPROJ_URL={URL}"\n      - "MODEL_ID={RP}"',1))
+        self.assertTrue(self.router.rp_vision(RP)); self.assertFalse(self.router.rp_vision(None))
+        self.assertFalse(self.router.rp_vision('unknown'))
+        self.assertTrue(self.run_req(media_req(dry_run=True))[1]['rtr']['rp_vision'])
+    def test_prefill_rp_timed_after_reload(self):
+        msgs=[{'role':'user','content':'the whole RP chat'}]
+        res=self.run_req(media_req(rp_prefill={'messages':msgs}))[1]['rtr']
+        self.assertIsInstance(res['timings']['prefill_rp_s'],float)
+        r1=self.seq('request',RP,max_tokens=1); self.assertEqual(len(r1),2)   # reload, then the re-read
+        self.assertLess(self.seq('load_ok',RP)[0],r1[1]); self.assertLess(r1[1],self.seq('reply',RP)[-1]+1)
+        self.assert_rp_back()
+    def test_nvidia_info_parse(self):
+        out=mock.Mock(returncode=0,stdout='NVIDIA RTX A6000, 49140\nNVIDIA RTX A6000, 49140\n')
+        with mock.patch.object(rtr.subprocess,'run',return_value=out):
+            self.assertEqual(rtr.nvidia_info(),{'name':'NVIDIA RTX A6000 + NVIDIA RTX A6000','total_mb':98280})
+        with mock.patch.object(rtr.subprocess,'run',side_effect=FileNotFoundError):
+            self.assertIsNone(rtr.nvidia_info())
+
 class MmprojHash(Base):
     def test_hash_pending_then_cached(self):
         p=rtr.dl_path(URL,self.d); self.assertEqual(os.path.basename(p),hashlib.md5(URL.encode()).hexdigest()[:8]+'_mmproj-omni.gguf')
@@ -361,8 +465,8 @@ class GuardBase(Base):
         out.append(call(self.gp,'POST','/v1/chat/completions',
                         {'model':'whatever','max_tokens':5,'messages':[{'role':'user','content':'hi'}]}))
 
-class TF3Guard(GuardBase):
-    """Brief T-F3 / §8a T-F1 mid-swap hold + T-F2 routing."""
+class GuardHold(GuardBase):
+    """§8a T-F1 mid-swap hold / 503 on timeout, and T-F2 routing."""
     def test_media_dossier_forwarded_to_rtr(self):
         code,b,_=call(self.gp,'POST','/v1/chat/completions',media_req(),timeout=30)
         self.assertEqual((code,b['model'],b['rtr']['status']),(200,'media-dossier','ok'))
@@ -400,6 +504,80 @@ class TF3Guard(GuardBase):
             self.assertEqual(call(self.gp,'GET','/health')[0],200)
             rp=[]; self.rp_chat(rp); self.assertEqual(rp[0][0],503)
 
+class GuardRtrDownCors(GuardBase):
+    """§8a T-F2: RTR down -> JSON 503 (#13); CORS on the media route (P6 #2). Real browsers [U]."""
+    def post(self,origin=None,body=None):
+        h={'Content-Type':'application/json'}
+        if origin: h['Origin']=origin
+        c=http.client.HTTPConnection('127.0.0.1',self.gp,timeout=30)
+        try:
+            c.request('POST','/v1/chat/completions',json.dumps(body or media_req()),h); r=c.getresponse()
+            return r.status,r.read(),r
+        finally: c.close()
+    def preflight(self,origin,path='/v1/chat/completions'):
+        c=http.client.HTTPConnection('127.0.0.1',self.gp,timeout=10)
+        try:
+            c.request('OPTIONS',path,headers={'Origin':origin,'Access-Control-Request-Method':'POST',
+                                              'Access-Control-Request-Headers':'content-type'})
+            r=c.getresponse(); r.read(); return r.status,r
+        finally: c.close()
+    def test_rtr_down_json_503(self):
+        with mock.patch.object(guard,'RTR_PORT',1):
+            code,raw,r=self.post()
+        self.assertEqual(code,503); self.assertEqual(r.getheader('Content-Type'),'application/json')
+        self.assertEqual(json.loads(raw),{'error':{'message':'media router unavailable','type':'service_unavailable'}})
+        self.assertEqual([e for e in self.ls.events('request') if e['model'] in ('media-dossier',MM)],[])
+        rp=[]; self.rp_chat(rp); self.assertEqual(rp[0][0],200)  # chat stays up
+    def test_preflight_loopback_allowed(self):
+        for o in ('http://localhost:8000','http://127.0.0.1:8000','http://tauri.localhost','tauri://localhost','http://[::1]:8000'):
+            code,r=self.preflight(o)
+            self.assertEqual(code,204,o); self.assertEqual(r.getheader('Access-Control-Allow-Origin'),o)
+            self.assertIn('POST',r.getheader('Access-Control-Allow-Methods'))
+            self.assertEqual(r.getheader('Access-Control-Allow-Headers'),'content-type')
+    def test_preflight_other_origin_not_allowed(self):
+        code,r=self.preflight('https://evil.example')
+        self.assertNotEqual(code,204); self.assertIsNone(r.getheader('Access-Control-Allow-Origin'))
+    def test_allow_list_env(self):
+        with mock.patch.object(guard,'RTR_CORS_ORIGINS','https://st.example.net, https://x.example'):
+            self.assertEqual(self.preflight('https://st.example.net')[0],204)
+            code,raw,r=self.post('https://st.example.net')
+            self.assertEqual((code,r.getheader('Access-Control-Allow-Origin')),(200,'https://st.example.net'))
+            self.assertNotEqual(self.preflight('https://other.example')[0],204)
+        with mock.patch.object(guard,'RTR_CORS_ORIGINS','*'):
+            self.assertTrue(guard.cors_allowed('https://anything.example'))
+        self.assertFalse(guard.cors_allowed('https://localhost.evil.example')); self.assertFalse(guard.cors_allowed('null'))
+        self.assertFalse(guard.cors_allowed('ftp://localhost'))
+    def test_post_media_cors_headers(self):
+        code,raw,r=self.post('http://localhost:8000')
+        self.assertEqual(code,200); self.assertEqual(r.getheader('Access-Control-Allow-Origin'),'http://localhost:8000')
+        self.assertEqual(r.getheader('Vary'),'Origin')
+        code,raw,r=self.post('https://evil.example')
+        self.assertEqual(code,200); self.assertIsNone(r.getheader('Access-Control-Allow-Origin'))
+        with mock.patch.object(guard,'RTR_PORT',1):
+            code,raw,r=self.post('http://localhost:8000')
+        self.assertEqual((code,r.getheader('Access-Control-Allow-Origin')),(503,'http://localhost:8000'))
+    def test_rp_chat_post_gets_no_cors(self):
+        code,raw,r=self.post('http://localhost:8000',{'model':'x','max_tokens':5,'messages':[{'role':'user','content':'hi'}]})
+        self.assertEqual(code,200); self.assertIsNone(r.getheader('Access-Control-Allow-Origin'))
+
+class ModelsList(GuardBase):
+    """§8a T-F2: /v1/models never lists media-dossier, with expose_active_only on and off."""
+    def ids(self): 
+        code,b,_=call(self.gp,'GET','/v1/models'); self.assertEqual(code,200); return [m['id'] for m in b['data']]
+    def test_never_listed(self):
+        flag=os.path.join(self.d,'expose')
+        with mock.patch.object(guard,'EXPOSE_ACTIVE_ONLY_FILE',flag):
+            for v,want in (('1',[RP]),('0',None)):
+                with open(flag,'w') as f: f.write(v)
+                ids=self.ids(); self.assertNotIn('media-dossier',ids)
+                if want: self.assertEqual(ids,want)
+                else: self.assertEqual(sorted(ids),sorted([RP,CO,MM,MM2]))
+            # also after a media pass and while a media model coexists
+            self.run_req(); call(self.ls.port,'GET',f'/upstream/{MM}/health')
+            for v in ('1','0'):
+                with open(flag,'w') as f: f.write(v)
+                self.assertNotIn('media-dossier',self.ids())
+
 class GuardRunningV277(GuardBase):
     """Regression: guard parsed /running as a string/dict; v277 returns a list."""
     def test_parse_running_shapes(self):
@@ -433,6 +611,14 @@ class InitWiring(unittest.TestCase):
         self.assertIn('RTR_PORT=${RTR_PORT:-8082}',self.sh)
         self.assertIn('wait_port rtr "$RTR_PORT"',self.sh)
         self.assertLess(self.sh.index('wait_port guard 8081'),self.sh.index('python3 /tmp/rtr.py'))
+    def test_watchdog_restarts_rtr(self):
+        wd=self.sh[self.sh.index('tunnel_watchdog(){'):]; wd=wd[:wd.index('\n}\n')]
+        self.assertIn('kill -0 "$RTR_PID"',wd)
+        self.assertIn('rtr_max=5',wd); self.assertIn('(( rtr_restarts > rtr_max ))',wd)
+        self.assertIn('ERR "rtr exited unexpectedly (restart $rtr_restarts/$rtr_max)"',wd)
+        self.assertIn('LOG "rtr restarted (pid=$RTR_PID)"',wd); self.assertIn('_launch_rtr',wd)
+        self.assertNotIn('break',wd[wd.index('rtr_restarts=$(( rtr_restarts + 1 ))'):])  # RTR never ends the loop
+        self.assertIn('python3 /tmp/rtr.py >> /tmp/rtr.log',self.sh)
     def test_caddyfile_unchanged_by_rtr(self):
         self.assertNotIn('8082',self.sh[self.sh.find('Caddyfile'):self.sh.find('Caddyfile')+2000] if 'Caddyfile' in self.sh else '')
 

@@ -22,9 +22,17 @@
   mmproj, and llama-server cannot save a slot while an mmproj is loaded, so no
   slot save/restore is built. After a swap the RP's next reply re-reads the
   whole chat. There is no RP context cap, so at long context this re-prefill
-  is likely the largest part of a swap. Its time has not been measured, and
-  RTR does not report it yet, so the extension's swap estimate stays
-  "unknown" for that term.
+  is likely the largest part of a swap. RTR reports it as
+  `timings.prefill_rp_s` when the request sends `rp_prefill`; the real time has
+  not been measured [U], so the extension's swap estimate stays "unknown" for
+  that term until it has.
+- Shared single slot when the media model is the role-play model [U]. With a
+  `PARALLEL=1` media model serving as the RP (same model, or a running media
+  model counted as the RP), a chat request queues behind the media extract on
+  the one slot. A long extract can use up guard's 600 s generation timeout,
+  and the extract replaces the chat's cached prompt, so the next chat reply
+  re-reads the whole chat. Nothing is built for this; it is to be measured on
+  Run 2 first (see below).
 - Qwen3-Omni Q4_K_M VRAM is unmeasured. Its `overhead_mb` is copied from the
   Q8 measurement (34,054 MiB at ctx 8192 on an A6000), so the ~21 GiB figure
   and the Q4 coexist sets built from it are estimates. Q4 quality is also
@@ -45,6 +53,15 @@
   over GPUs) and the `llama-server --version` parsing have not been run
   against the real programs. Wrong VRAM or version data falls back to swap or
   is informational only.
+
+## Run 2 measurement items
+Not measured yet; to be timed on the next approved rental (Run 2). None of
+these is run or approved by this repo.
+- R1, shared single slot: with a `PARALLEL=1` media model as the RP, how long
+  chat waits behind an extract, whether it reaches guard's 600 s timeout, and
+  the re-prefill cost after the extract replaces the cached prompt.
+- `timings.prefill_rp_s` on a long chat after a swap reload.
+- Real browser CORS from the SillyTavern origin against guard's media route.
 
 ## Download verification
 - Every downloaded model file is hashed once after its download (see

@@ -296,10 +296,31 @@ projector's sha256 and the llama.cpp build string (both informational).
 
 The request carries an `rtr` object: `media_model` (a llama-swap model id,
 required), and optionally `rp_model`, `kind` (`dossier` or `delta`),
-`dry_run` (return only the plan: coexist or swap, and what would be evicted)
-and `flush` (queued follow-up questions answered while the media model is
-loaded). Without a `response_format`, RTR asks for the dossier JSON schema; a
-reply that does not validate is repaired once, then returned as `partial`.
+`dry_run` (return only the plan: coexist or swap, and what would be evicted),
+`flush` (queued follow-up questions answered while the media model is
+loaded) and `rp_prefill` (`{"messages": [...]}`, the role-play chat to re-read
+right after the role-play model is reloaded, so that re-read is timed and the
+cache is warm before guard lets chat through). Without a `response_format`,
+RTR asks for the dossier JSON schema; a reply that does not validate is
+repaired once, then returned as `partial`. Each flushed item gets the same
+repair pass against the delta schema (`answers`, `timeline_add`, `uncertain`).
+
+Besides the dossier, the `rtr` result (and a `dry_run` plan) carries these
+fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `rp_vision` | bool | the role-play model's llama-swap entry has a non-empty `MMPROJ_URL`, so `serve.py` starts it with `--mmproj`; `false` when there is no RP or the id is not in the config |
+| `co_set` | string or null | the llama-swap matrix set that holds both the RP and the media model, whether or not this pass used it |
+| `gpu` | object or null | what the planner used: `{"name", "total_mb", "free_mb", "need_mb", "margin_mb"}`; `name` and `total_mb` come from one `nvidia-smi` query at RTR start (names joined with ` + `, totals summed), `free_mb` is the free VRAM read for this plan; any of these is `null` when unknown, and the whole field is `null` when nothing was read |
+| `timings.prefill_rp_s` | number or null | seconds to re-read `rp_prefill.messages` after the RP reload; `null` in coexist mode, when the RP was kept, or without `rp_prefill` |
+| `rp_prefill_error` | string | only present when that re-read failed |
+| `flushed[].repaired` | bool | the flushed answer went through the repair pass |
+
+A running media model counts as the role-play model. If the RP is the media
+model itself (`rp_model` equals `media_model`), RTR loads it once and keeps it
+loaded (`rp_reload` is `{"ok": true, "attempts": 0, "kept": true}`); if it is
+already running beside nothing else, the pass runs without a swap.
 
 RTR keeps the role-play model loaded and runs the media model beside it only
 when llama-swap's config has a coexist set for the pair and `nvidia-smi`
@@ -311,11 +332,23 @@ one-token request. The reload runs even when a step fails.
 During a swap guard holds other generation requests until the swap ends, for
 at most `SWAP_HOLD_S` seconds (default `600`). After that the request gets
 `503` with `{"error":{"message":"media swap in progress",...}}` and a
-`Retry-After` header. If RTR is down, guard does not hold anything. RTR logs
-to `/tmp/rtr.log`; a failure to start is logged but does not stop the boot.
+`Retry-After` header. If RTR is down, guard does not hold anything, and a
+`media-dossier` request gets `503` with
+`{"error":{"message":"media router unavailable","type":"service_unavailable"}}`.
+RTR logs to `/tmp/rtr.log`; a failure to start is logged but does not stop the
+boot. The boot watchdog restarts RTR when it exits, up to 5 times, logging
+each restart.
+
+For a browser client on another origin, guard answers CORS preflights
+(`OPTIONS` with `Access-Control-Request-Method`, `204`) on the generation paths
+and adds `Access-Control-Allow-Origin` to `media-dossier` responses. By default
+only loopback origins (`localhost`, `127.0.0.1`, `[::1]`, `*.localhost`, over
+`http`, `https` or `tauri`) are allowed; `RTR_CORS_ORIGINS` adds exact origins
+(comma-separated) or `*`. This adds headers on the existing path only; no port
+is opened. Real browser behaviour is untested.
 
 After a swap the role-play model starts with an empty cache, so its next reply
-re-reads the whole chat. RTR has been tested only against the fake llama-swap
+re-reads the whole chat, unless the request sent `rp_prefill`. RTR has been tested only against the fake llama-swap
 in `tests/`; see [docs/known-issues.md](docs/known-issues.md) for this and the
 other open limits.
 
@@ -326,6 +359,7 @@ other open limits.
 | `RTR_TIMEOUT_S` | `1800` | guard's timeout for a media request |
 | `RTR_LOAD_TIMEOUT_S` | `900` | RTR's timeout for each load or unload |
 | `RTR_GEN_TIMEOUT_S` | `600` | RTR's timeout for each media generation |
+| `RTR_CORS_ORIGINS` | *(loopback only)* | extra origins allowed to call `media-dossier` from a browser, comma-separated, or `*` |
 
 ## Where the model list comes from
 

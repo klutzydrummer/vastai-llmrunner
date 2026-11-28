@@ -382,8 +382,15 @@ _launch_cloudflared(){
     TUNNEL_PID=$!
 }
 
+# RTR restart, used by tunnel_watchdog; appends to the boot log
+_launch_rtr(){
+    python3 /tmp/rtr.py >> /tmp/rtr.log 2>&1 &
+    RTR_PID=$!
+}
+
 tunnel_watchdog(){
     local max_restarts=10 restarts=0
+    local rtr_max=5 rtr_restarts=0
     _launch_cloudflared
     LOG "cloudflared started (pid=$TUNNEL_PID)"
 
@@ -399,6 +406,19 @@ tunnel_watchdog(){
             sleep 5
             _launch_cloudflared
             LOG "cloudflared restarted (pid=$TUNNEL_PID)"
+        fi
+        # RTR (media router): restart when it exits, capped. Chat never waits on
+        # it; guard answers media-dossier with a JSON 503 while it is down.
+        if [ -n "${RTR_PID:-}" ] && (( rtr_restarts <= rtr_max )) && ! kill -0 "$RTR_PID" 2>/dev/null; then
+            rtr_restarts=$(( rtr_restarts + 1 ))
+            if (( rtr_restarts > rtr_max )); then
+                ERR "rtr died $rtr_max times; continuing without media routing"
+            else
+                ERR "rtr exited unexpectedly (restart $rtr_restarts/$rtr_max)"
+                tail -5 /tmp/rtr.log >&2
+                _launch_rtr
+                LOG "rtr restarted (pid=$RTR_PID)"
+            fi
         fi
         sleep 5
     done

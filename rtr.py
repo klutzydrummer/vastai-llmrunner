@@ -20,7 +20,11 @@ Request (POST /v1/chat/completions, model "media-dossier"):
           "rp_model":"<LS id>"?,                      # default: the running RP
           "kind":"dossier"|"delta"?,                  # delta = batched requery output
           "dry_run":true?,                            # plan only: mode + would_evict
-          "flush":[{"id":str,"messages":[...],"max_tokens":N?}]?}}
+          "flush":[{"id":str,"messages":[...],"max_tokens":N?}]?,  # repaired like first passes
+          "rp_prefill":{"messages":[...]}?}}           # RP chat to re-read after a swap reload
+Result extras (README "Media router (RTR)"): rp_vision, co_set, gpu, timings.prefill_rp_s.
+Same model (user decision): a running media model counts as the RP when no
+rp_model is given; when the RP is the media model it is loaded once and kept.
 GET /rtr/state  -> {"swapping":bool,"busy":bool,"since":ts|null}   (guard polls this)
 GET /health     -> "OK"
 
@@ -204,6 +208,20 @@ def nvidia_free_mb():
     except Exception:
         return None
 
+def nvidia_info():
+    """Static GPU facts for the result's `gpu` field: {"name": str, "total_mb": int}
+    (names joined with " + ", totals summed over GPUs); None when unknown."""
+    try:
+        r=subprocess.run(['nvidia-smi','--query-gpu=name,memory.total','--format=csv,noheader,nounits'],
+                         capture_output=True,text=True,timeout=20)
+        if r.returncode!=0: return None
+        rows=[[c.strip() for c in l.split(',')] for l in r.stdout.splitlines() if l.strip()]
+        rows=[x for x in rows if len(x)==2]
+        if not rows: return None
+        return {'name':' + '.join(x[0] for x in rows),'total_mb':sum(int(float(x[1])) for x in rows)}
+    except Exception:
+        return None
+
 def llama_build():
     """llama-server --version, recorded per dossier as info only (Q21)."""
     for p in ['/app/llama-server','/llama-server']:
@@ -277,9 +295,10 @@ class Router:
     def __init__(self,ls_port=8080,config_path='/app/config.yaml',model_dir='/models',
                  hash_cache='/tmp/rtr_mmproj_sha256.json',free_vram=nvidia_free_mb,
                  media_needs=media_needs,build=llama_build,load_timeout=900,gen_timeout=600,
-                 lock_wait=1800,reload_retry_s=1.0):
+                 lock_wait=1800,reload_retry_s=1.0,gpu_info=nvidia_info):
         self.ls_port=ls_port; self.config_path=config_path; self.model_dir=model_dir
         self.free_vram=free_vram; self.media_needs_fn=media_needs; self.build_fn=build
+        self.gpu_info_fn=gpu_info; self.gpu=None
         self.load_timeout=load_timeout; self.gen_timeout=gen_timeout; self.lock_wait=lock_wait
         self.reload_retry_s=reload_retry_s
         self.hashes=HashCache(hash_cache)
@@ -292,6 +311,8 @@ class Router:
             try: self.build=self.build_fn()
             except Exception: self.build=None
             self.build_state='ok' if self.build else 'unknown'
+            try: self.gpu=self.gpu_info_fn()
+            except Exception: self.gpu=None
             try:
                 for mid,env in self.config()['models'].items():
                     p=dl_path(env.get('MMPROJ_URL',''),self.model_dir)
@@ -331,13 +352,16 @@ class Router:
     def plan(self,mm,rp,running):
         cfg=self.config(); needs=self.needs()
         others=[m for m in running if m not in (mm,rp)]
-        p={'media_model':mm,'rp_model':rp,'running':running,'free_mb':None,'need_mb':needs.get(mm)}
+        co_set=next((n for n,r,ms in cfg['sets'] if rp==r and mm in ms),None)
+        p={'media_model':mm,'rp_model':rp,'running':running,'free_mb':None,'need_mb':needs.get(mm),
+           'co_set':co_set}
         if mm in running:
             return dict(p,mode='coexist',would_evict=[],reason='media model already loaded')
         if not rp:
             return dict(p,mode='solo',would_evict=list(running),reason='no RP loaded')
-        in_set=any(rp==r and mm in ms for _n,r,ms in cfg['sets'])
-        if not in_set:
+        if rp==mm:  # B2: the media model is also the RP: load it once and keep it loaded
+            return dict(p,mode='swap',would_evict=list(running),reason='RP is the media model: load once, keep loaded')
+        if not co_set:
             return dict(p,mode='swap',would_evict=[rp]+others,reason='no coexist set for this RP and media model')
         free=self.free_vram(); p['free_mb']=free
         need=p['need_mb']
@@ -351,10 +375,22 @@ class Router:
                         reason=f'live free {free} MiB < need {need} + {CO_MARGIN_MB} MiB')
         return dict(p,mode='coexist',would_evict=others,reason='coexist set and live VRAM fit')
     @staticmethod
-    def pick_rp(running,media):
+    def pick_rp(running,media,mm=None):
+        """The running RP when the caller names none. Order: an '@co' variant, any
+        other non-media model, then a running media model (it counts as the RP:
+        another media id first, B4, then `mm` itself, B3); None when nothing runs."""
         cands=[m for m in running if m not in media]
         co=[m for m in cands if re.search(r'@co(-\d+)?$',m)]
-        return (co or cands or [None])[0]
+        alt=[m for m in running if m in media and m!=mm]+[m for m in running if m==mm]
+        return (co or cands or alt or [None])[0]
+    def rp_vision(self,rp):
+        """True when the RP's llama-swap entry loads an mmproj. cfginit writes
+        MMPROJ_URL into every entry (blank for '-text' variants and models without
+        one) and serve.py passes --mmproj when it is set, so a non-empty value
+        means the running RP has a media projector. False when unknown."""
+        if not rp: return False
+        u=(self.config()['models'].get(rp,{}).get('MMPROJ_URL') or '').strip()
+        return bool(u) and u!='null'
     # steps
     def _timed(self,timings,name,fn):
         t=time.time()
@@ -389,20 +425,26 @@ class Router:
         body={k:v for k,v in req.items() if k not in ('model','rtr','stream','stream_options')}
         body['model']=mm; body.setdefault('response_format',response_format(kind))
         content,raw=self._timed(timings,'extract_s',lambda:self.chat(body,'extract'))
-        obj=parse_json(content); errs=validate_dossier(obj) if kind=='dossier' else check(obj)
-        if obj is None: errs=['reply is not a JSON object']
-        out={'status':'ok','repaired':False,'errors':[],'usage':raw.get('usage'),'llama_timings':raw.get('timings')}
-        if not errs: return dict(out,result=obj)
+        out={'usage':raw.get('usage'),'llama_timings':raw.get('timings')}
+        out.update(self.check_repair(body,content,check,lambda rb:self._timed(timings,'repair_s',lambda:self.chat(rb,'repair'))))
+        return out
+    @staticmethod
+    def check_repair(body,content,check,send):
+        """Validate a reply; if it fails, one repair request while the MM is
+        resident (§1.2 step 8). Used for first passes and flushed requeries (P3 #8).
+        Returns {status ok|partial, result, errors, repaired}."""
+        obj=parse_json(content); errs=['reply is not a JSON object'] if obj is None else check(obj)
+        if not errs: return {'status':'ok','result':obj,'errors':[],'repaired':False}
         rb=dict(body,messages=list(body.get('messages') or [])+[
             {'role':'assistant','content':content},
             {'role':'user','content':REPAIR_PROMPT.format(errs='; '.join(errs[:10]))}])
         try:
-            c2,_=self._timed(timings,'repair_s',lambda:self.chat(rb,'repair'))
+            c2,_=send(rb)
             o2=parse_json(c2); e2=['reply is not a JSON object'] if o2 is None else check(o2)
-            if not e2: return dict(out,result=o2,repaired=True)
-            return dict(out,status='partial',result=o2 if o2 is not None else obj,errors=e2,repaired=True)
+            if not e2: return {'status':'ok','result':o2,'errors':[],'repaired':True}
+            return {'status':'partial','result':o2 if o2 is not None else obj,'errors':e2,'repaired':True}
         except StepError as e:
-            return dict(out,status='partial',result=obj,errors=errs+[f'repair: {e}'],repaired=True)
+            return {'status':'partial','result':obj,'errors':errs+[f'repair: {e}'],'repaired':True}
     def flush(self,items,mm,timings):
         """Piggyback (Q31a): queued requeries for this MM while it is resident."""
         out=[]; t=time.time()
@@ -413,11 +455,12 @@ class Router:
                     raise StepError('flush','item needs id and messages')
                 body={'model':mm,'messages':it['messages'],'response_format':response_format('delta')}
                 if it.get('max_tokens'): body['max_tokens']=it['max_tokens']
-                c,_=self.chat(body,'flush'); o=parse_json(c)
-                e=['reply is not a JSON object'] if o is None else validate_delta(o)
-                out.append({'id':iid,'status':'partial' if e else 'ok','delta':o,'errors':e})
+                c,_=self.chat(body,'flush')
+                v=self.check_repair(body,c,validate_delta,lambda rb:self.chat(rb,'flush_repair'))
+                out.append({'id':iid,'status':v['status'],'delta':v['result'],'errors':v['errors'],
+                            'repaired':v['repaired']})
             except StepError as e:
-                out.append({'id':iid,'status':'failed','delta':None,'errors':[str(e)]})
+                out.append({'id':iid,'status':'failed','delta':None,'errors':[str(e)],'repaired':False})
         if items: timings['flush_s']=round(time.time()-t,3)
         return out
     # one request
@@ -439,10 +482,12 @@ class Router:
             try: running=self.running()
             except Exception as e: return 502,err_body(f'llama-swap unreachable: {e}','rtr_error',step='running')
             needs=self.needs()
-            rp=r.get('rp_model') or self.pick_rp(running,set(needs)|{mm})
+            rp=r.get('rp_model') or self.pick_rp(running,set(needs)|{mm},mm)
             plan=self.plan(mm,rp,running)
-            if r.get('dry_run'): return 200,completion({'status':'plan','plan':plan})
-            res={'kind':kind,'media_model':mm,'rp_model':rp,'mode':plan['mode'],'plan':plan,'timings':timings}
+            extras={'rp_vision':self.rp_vision(rp),'co_set':plan['co_set'],'gpu':self.gpu_used(plan)}
+            if r.get('dry_run'): return 200,completion(dict(extras,status='plan',plan=plan))
+            timings['prefill_rp_s']=None
+            res=dict(extras,kind=kind,media_model=mm,rp_model=rp,mode=plan['mode'],plan=plan,timings=timings)
             if plan['mode']=='coexist':
                 try:
                     ex=self.extract(req,mm,kind,timings)
@@ -458,6 +503,25 @@ class Router:
         finally:
             self._set(busy=False,swapping=False,since=None)
             self.lock.release()
+    def gpu_used(self,plan):
+        """`gpu` result field: static name/total from boot (nvidia_info) plus the
+        free VRAM the planner read (null when it did not read it); None when all unknown."""
+        g=dict(self.gpu) if isinstance(self.gpu,dict) else {'name':None,'total_mb':None}
+        g.update(free_mb=plan.get('free_mb'),need_mb=plan.get('need_mb'),margin_mb=CO_MARGIN_MB)
+        return g if (g['name'] or g['total_mb'] is not None or g['free_mb'] is not None) else None
+    def prefill_rp(self,rp,r,timings,res):
+        """timings.prefill_rp_s: after a swap reload, re-read the caller's RP chat
+        (`rtr.rp_prefill.messages`) with max_tokens 1 and time it. This also warms
+        the RP's prompt cache before guard releases held chat. Null when not asked."""
+        pf=r.get('rp_prefill')
+        if not (isinstance(pf,dict) and isinstance(pf.get('messages'),list) and pf['messages']): return
+        t=time.time()
+        try:
+            st,d=self.ls('POST','/v1/chat/completions',{'model':rp,'max_tokens':1,'messages':pf['messages']},
+                         timeout=self.gen_timeout)
+            if st==200: timings['prefill_rp_s']=round(time.time()-t,3)
+            else: res['rp_prefill_error']=f'HTTP {st}: {d}'
+        except Exception as e: res['rp_prefill_error']=str(e)
     def swap(self,req,r,mm,rp,kind,res,timings,t0,rp_running):
         self._set(swapping=True,since=time.time())
         mm_touched=False
@@ -472,11 +536,15 @@ class Router:
         except Exception as e:
             res.update(status='failed',step='internal',error=f'{type(e).__name__}: {e}')
         finally:
-            if mm_touched:
+            same=rp==mm   # B2: the RP is the media model; it stays loaded, no second load
+            if mm_touched and not same:
                 try: self._timed(timings,'unload_mm_s',lambda:self.unload(mm,'unload_mm'))
                 except Exception as e: res['unload_mm_error']=str(e)
-            if rp:
+            if same and res.get('status')!='failed':
+                res['rp_reload']={'ok':True,'attempts':0,'kept':True}
+            elif rp:
                 res['rp_reload']=self._timed(timings,'reload_rp_s',lambda:self.reload_rp(rp))
+                if res['rp_reload']['ok']: self.prefill_rp(rp,r,timings,res)
             else: res['rp_reload']=None
             self._set(swapping=False)
         return self.finish(res,mm,t0)
